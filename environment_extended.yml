@@ -1,0 +1,35 @@
+name: global-modeling-paper-extended
+channels:
+  - pytorch
+  - pyg # For PyTorch Geometric (GNNs)
+  - huggingface # For Transformers
+  - anaconda
+  - conda-forge
+  - defaults
+dependencies:
+  # --- 原有的依赖 (从 environment.yml 复制) ---
+  - _libgcc_mutex=0.1=conda_forge
+  - _openmp_mutex=4.5=2_kmp_llvm
+  - attrs=23.1.0=pyh71513ae_1
+  - blosc=1.21.4=h0f2a231_0
+  # ... (此处省略所有原有依赖) ...
+  - zstd=1.5.2=h3eb15da_6
+  
+  # --- 新增的 ML 依赖 ---
+  - pytorch 
+  - torchvision
+  - torchaudio
+  # - pytorch-cuda=11.8 # (根据您的 CUDA 版本选择)
+  - pyg # (用于 GNN)
+  - transformers # (用于 Transformer)
+  - scikit-learn # (用于 GNN/Transformer 之外的 ML)
+
+  - pip:
+      # --- 原有的 pip 依赖 (从 environment.yml 复制) ---
+      - anyio==3.7.0
+      # ... (此处省略所有原有 pip 依赖) ...
+      - websocket-client==1.5.3
+      
+      # --- (或者在这里添加 pip 依赖) ---
+      # - tensorflow
+prefix: /home/gsnearing/miniconda3/envs/global-modeling-paper-extended

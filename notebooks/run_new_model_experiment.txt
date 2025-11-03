@@ -1,0 +1,161 @@
+# notebooks/run_new_model_experiment.ipynb
+
+# %% [markdown]
+# # 运行新的高级 ML 实验
+# 
+# 这个 Notebook 用于协调新模型 (`AdvancedModel`) 的训练和预测流程。
+# 
+# 流程：
+# 1. 导入 `AdvancedModel` (来自 `../models/my_advanced_model.py`)。
+# 2. 导入 `loading_utils` 和 `gauge_groups_utils` 来加载数据和站点列表。
+# 3. 定义一个实验 (例如，k-fold,  hydrologically_separated)。
+# 4. 运行模型的 `.train()` 和 `.predict()` 方法。
+# 5. 结果将保存到 `~/model_data/[EXPERIMENT_NAME]/`。
+#
+# 之后, 您可以运行 `calculate_return_period_metrics.ipynb` 和 `calculate_standard_hydrograph_metrics.ipynb` 来评估这些结果。
+
+# %%
+import sys
+import os
+import pathlib
+
+# 将 'backend' 和 'models' 目录添加到路径中
+notebook_dir = os.getcwd()
+parent_dir = os.path.dirname(notebook_dir)
+sys.path.append(os.path.join(notebook_dir, 'backend'))
+sys.path.append(parent_dir) # 添加根目录以访问 'models'
+
+# %%
+# 导入后端 utils
+from backend import data_paths
+from backend import loading_utils
+from backend import gauge_groups_utils #
+from backend import metrics_utils
+
+# 导入您的新模型
+try:
+    from models.my_advanced_model import AdvancedModel
+except ImportError:
+    print("Error: 'models.my_advanced_model' not found.")
+    print("Please ensure 'models/my_advanced_model.py' exists.")
+
+# %% [markdown]
+# ## 1. 设置实验参数
+
+# %%
+# TODO: 定义您的模型超参数
+model_params = {
+    'learning_rate': 1e-4,
+    'layers': 8,
+    'hidden_dim': 128,
+    'model_type': 'GNN_LSTM' # 或 'Transformer'
+}
+
+# TODO: 定义您的实验名称 (这将是保存预测的目录名)
+# 示例: 'my_gnn_kfold', 'my_transformer_fullrun'
+EXPERIMENT_NAME = 'my_gnn_kfold_test'
+
+# TODO: 选择您要运行的交叉验证 (CV) 类型
+# 可选项: 'kfold_splits', 'continent_splits', 'climate_splits', 'hydrologically_separated', 'full_run'
+CV_TYPE = 'kfold_splits' 
+
+# TODO: 选择 CV 折数 (例如, kfold 有 0-9)
+# 对于 'full_run'，将其设置为 None
+# [!!] 运行 k-fold 时，您需要将此 notebook 循环运行 10 次 (0 到 9)
+CV_FOLD_INDEX = 0 
+
+# %% [markdown]
+# ## 2. 加载站点列表 (Train/Test)
+
+# %%
+print(f"Setting up experiment: {EXPERIMENT_NAME}")
+print(f"Cross-validation type: {CV_TYPE}, Fold: {CV_FOLD_INDEX}")
+
+# 加载站点的训练/测试划分
+#
+if CV_TYPE == 'full_run':
+    # 在所有数据上训练 (用于最终模型) 或预测 (如果已训练)
+    all_gauges = gauge_groups_utils.load_gauge_group('grdc_filtered') #
+    training_gauges = all_gauges
+    prediction_gauges = all_gauges
+elif CV_TYPE in ['kfold_splits', 'hydrologically_separated']:
+    # K-fold 或水文分离
+    training_gauges, prediction_gauges = gauge_groups_utils.load_kfold_split(
+        fold_num=CV_FOLD_INDEX,
+        k_fold_experiment_name=CV_TYPE
+    )
+else:
+    # 洲或气候划分
+    # (您需要为 'group_name' 提供一个具体值, e.g., 'continent_splits/africa')
+    print(f"Loading split for {CV_TYPE}. Note: 'group_name' must be specific.")
+    # 示例:
+    # group_name = 'continent_splits/africa'
+    # training_gauges, prediction_gauges = gauge_groups_utils.load_ungauged_split(
+    #     group_name=group_name
+    # )
+    #
+    # (为防止出错，此处暂时使用 kfold 代替)
+    print("Example not run. Using kfold logic as fallback.")
+    training_gauges, prediction_gauges = gauge_groups_utils.load_kfold_split(
+        fold_num=CV_FOLD_INDEX,
+        k_fold_experiment_name='kfold_splits'
+    )
+
+
+print(f"Total training gauges: {len(training_gauges)}")
+print(f"Total prediction gauges: {len(prediction_gauges)}")
+
+# %% [markdown]
+# ## 3. 初始化和训练模型
+
+# %%
+# 构建一个唯一的实验名称，用于此 CV 折数
+# (注意: Nearing的论文 为每个折数训练了一个单独的模型)
+# (我们将预测保存在根实验名称下，因为评估脚本 是这样期望的)
+model = AdvancedModel(
+    model_params=model_params,
+    experiment_name=EXPERIMENT_NAME 
+)
+
+# %%
+# 运行训练
+# (在实际操作中，您可能只想在 CV_FOLD_INDEX == 0 时训练一次，
+# 或者如果您为每个折数重新训练，则每次都运行)
+# model.train(training_gauge_ids=training_gauges)
+
+print("Skipping training (simulation). Assuming model is pre-trained.")
+print("To train, uncomment 'model.train(...)'")
+
+
+# %% [markdown]
+# ## 4. 运行预测
+# 
+# 这将在 `prediction_gauges` (即测试集) 上运行推理，
+# 并将结果保存到 `~/model_data/[EXPERIMENT_NAME]/`
+#
+# **重要**: 原始论文为 K-fold 实验 所做的是：
+# 1. 训练 K 个模型 (每个模型在 K-1 折上训练)。
+# 2. 每个模型在它未见过的第 K 折上进行预测。
+# 3. 将所有 K 个预测集合 (每个集合来自不同的折数) 放在 *同一个* 文件夹中 (e.g., `~/model_data/kfold_splits/`)。
+# 4. 然后评估脚本 (`calculate_return_period_metrics.ipynb`) 在该文件夹上运行，评估所有站点的 *样本外* (out-of-sample) 预测。
+#
+# 我们的 `predict` 函数将预测保存到我们定义的 `EXPERIMENT_NAME` 文件夹中。
+# 您需要循环所有 K 折 (0-9)，运行此 notebook K 次，
+# 每次更改 `CV_FOLD_INDEX`，但保持 `EXPERIMENT_NAME` 不变。
+
+# %%
+print(f"Running prediction for fold {CV_FOLD_INDEX}...")
+model.predict(prediction_gauge_ids=prediction_gauges)
+
+# %% [markdown]
+# ## 5. 完成和后续步骤
+
+# %%
+print("---")
+print(f"Fold {CV_FOLD_INDEX} complete.")
+print(f"Predictions saved to {model.output_path}")
+print("---")
+print("\nNEXT STEP: Run this notebook again for the next CV_FOLD_INDEX (e.g., 1 through 9).")
+print("\nONCE ALL FOLDS ARE DONE: Open 'calculate_return_period_metrics.ipynb' and 'calculate_standard_hydrograph_metrics.ipynb',")
+print(f"and change their 'EXPERIMENTS' list variable to include: '{EXPERIMENT_NAME}'.")
+print("Then, run those notebooks to get the final metrics.")
