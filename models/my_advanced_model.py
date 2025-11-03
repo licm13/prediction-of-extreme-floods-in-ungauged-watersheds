@@ -23,12 +23,273 @@ except ImportError:
     print("Please ensure 'models' and 'notebooks' directories are siblings.")
     sys.exit(1)
 
-# TODO: 在此导入您选择的ML库
-# import torch
-# from torch.utils.data import DataLoader, Dataset
-# import torch_geometric
-# from torch_geometric.data import Data, Batch
-# ...
+# PyTorch and related imports
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+# PyTorch Geometric imports
+import torch_geometric
+from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
+from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader as GeometricDataLoader
+
+
+# ==================== Model Architecture ====================
+
+class HybridGNN_RNN(nn.Module):
+    """
+    混合 GNN-RNN 模型，用于水文预测。
+    - GNN 部分处理静态流域属性
+    - RNN 部分处理动态气象时间序列
+    - 融合层结合两者进行径流预测
+    """
+
+    def __init__(self,
+                 static_feature_dim: int,
+                 dynamic_feature_dim: int,
+                 gnn_hidden_dim: int = 64,
+                 rnn_hidden_dim: int = 128,
+                 rnn_num_layers: int = 2,
+                 rnn_type: str = 'lstm',
+                 output_lead_times: int = 10,
+                 dropout: float = 0.2):
+        """
+        Args:
+            static_feature_dim: 静态属性的特征数
+            dynamic_feature_dim: 动态气象输入的特征数
+            gnn_hidden_dim: GNN 隐藏层维度
+            rnn_hidden_dim: RNN 隐藏层维度
+            rnn_num_layers: RNN 层数
+            rnn_type: 'lstm' 或 'gru'
+            output_lead_times: 预测的前导时间数量
+            dropout: Dropout 率
+        """
+        super(HybridGNN_RNN, self).__init__()
+
+        self.rnn_type = rnn_type
+        self.rnn_hidden_dim = rnn_hidden_dim
+        self.rnn_num_layers = rnn_num_layers
+        self.output_lead_times = output_lead_times
+
+        # GNN 部分 - 处理静态流域属性
+        # 由于采用 "per-gauge" 方法，每个流域是单个节点
+        self.gnn_conv1 = GCNConv(static_feature_dim, gnn_hidden_dim)
+        self.gnn_conv2 = GCNConv(gnn_hidden_dim, gnn_hidden_dim)
+        self.gnn_bn1 = nn.BatchNorm1d(gnn_hidden_dim)
+        self.gnn_bn2 = nn.BatchNorm1d(gnn_hidden_dim)
+
+        # RNN 部分 - 处理动态气象输入
+        if rnn_type.lower() == 'lstm':
+            self.rnn = nn.LSTM(
+                input_size=dynamic_feature_dim,
+                hidden_size=rnn_hidden_dim,
+                num_layers=rnn_num_layers,
+                batch_first=True,
+                dropout=dropout if rnn_num_layers > 1 else 0.0
+            )
+        elif rnn_type.lower() == 'gru':
+            self.rnn = nn.GRU(
+                input_size=dynamic_feature_dim,
+                hidden_size=rnn_hidden_dim,
+                num_layers=rnn_num_layers,
+                batch_first=True,
+                dropout=dropout if rnn_num_layers > 1 else 0.0
+            )
+        else:
+            raise ValueError(f"Unsupported RNN type: {rnn_type}")
+
+        # 融合层 - 结合 GNN 和 RNN 的输出
+        fusion_input_dim = gnn_hidden_dim + rnn_hidden_dim
+        self.fusion_fc1 = nn.Linear(fusion_input_dim, 128)
+        self.fusion_bn = nn.BatchNorm1d(128)
+        self.fusion_fc2 = nn.Linear(128, 64)
+
+        # 输出层 - 预测多个前导时间的径流
+        self.output_fc = nn.Linear(64, output_lead_times)
+
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+
+    def forward(self, dynamic_features, static_graph_batch):
+        """
+        前向传播
+
+        Args:
+            dynamic_features: (batch_size, seq_len, dynamic_feature_dim) - 动态气象输入
+            static_graph_batch: PyG Batch 对象，包含静态流域属性图
+
+        Returns:
+            (batch_size, output_lead_times) - 多个前导时间的径流预测
+        """
+        # ===== GNN 部分 =====
+        # 处理静态流域属性
+        x_static = static_graph_batch.x
+        edge_index = static_graph_batch.edge_index
+        batch_idx = static_graph_batch.batch
+
+        # GNN 层
+        x_static = self.gnn_conv1(x_static, edge_index)
+        x_static = self.gnn_bn1(x_static)
+        x_static = self.relu(x_static)
+        x_static = self.dropout(x_static)
+
+        x_static = self.gnn_conv2(x_static, edge_index)
+        x_static = self.gnn_bn2(x_static)
+        x_static = self.relu(x_static)
+
+        # 由于每个图只有一个节点（per-gauge），直接使用节点特征
+        # 如果需要聚合多个节点，可以使用: x_static = global_mean_pool(x_static, batch_idx)
+        # 但在我们的情况下，每个样本只有一个节点
+        gnn_embedding = x_static  # (batch_size, gnn_hidden_dim)
+
+        # ===== RNN 部分 =====
+        # 处理动态时间序列
+        rnn_out, _ = self.rnn(dynamic_features)  # (batch_size, seq_len, rnn_hidden_dim)
+
+        # 使用最后一个时间步的输出
+        rnn_embedding = rnn_out[:, -1, :]  # (batch_size, rnn_hidden_dim)
+
+        # ===== 融合层 =====
+        # 连接 GNN 和 RNN 的嵌入
+        fused = torch.cat([gnn_embedding, rnn_embedding], dim=1)  # (batch_size, gnn_hidden_dim + rnn_hidden_dim)
+
+        # 融合层
+        x = self.fusion_fc1(fused)
+        x = self.fusion_bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        x = self.fusion_fc2(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        # 输出层
+        output = self.output_fc(x)  # (batch_size, output_lead_times)
+
+        return output
+
+
+# ==================== Custom Dataset ====================
+
+class HydroDataset(Dataset):
+    """
+    自定义 PyTorch Dataset，用于水文预测。
+    为每个站点生成训练样本（时间序列窗口）。
+    """
+
+    def __init__(self,
+                 gauge_ids: list,
+                 data_preparation_fn,
+                 seq_length: int = 365,
+                 pred_length: int = 10,
+                 samples_per_gauge: int = 10):
+        """
+        Args:
+            gauge_ids: 站点 ID 列表
+            data_preparation_fn: 数据准备函数（通常是 AdvancedModel._prepare_data_for_gauge）
+            seq_length: RNN 输入序列长度（天）
+            pred_length: 预测前导时间数量
+            samples_per_gauge: 每个站点随机采样的样本数
+        """
+        self.gauge_ids = gauge_ids
+        self.data_preparation_fn = data_preparation_fn
+        self.seq_length = seq_length
+        self.pred_length = pred_length
+        self.samples_per_gauge = samples_per_gauge
+
+        # 为每个站点预加载数据（可选，取决于内存）
+        # 这里我们采用懒加载策略
+
+    def __len__(self):
+        return len(self.gauge_ids) * self.samples_per_gauge
+
+    def __getitem__(self, idx):
+        """
+        返回一个训练样本。
+
+        Returns:
+            (rnn_input, gnn_graph_data, target)
+        """
+        # 确定是哪个站点
+        gauge_idx = idx // self.samples_per_gauge
+        gauge_id = self.gauge_ids[gauge_idx]
+
+        # 加载该站点的完整数据
+        dynamic_features, static_features, targets = self.data_preparation_fn(gauge_id)
+
+        if dynamic_features is None or static_features is None or targets is None:
+            # 返回空样本（在 collate_fn 中过滤）
+            return None
+
+        # 清理 NaN
+        valid_mask = ~(dynamic_features.isna().any(axis=1) | targets.isna())
+        dynamic_features = dynamic_features[valid_mask]
+        targets = targets[valid_mask]
+
+        if len(targets) < self.seq_length + self.pred_length:
+            # 数据不足
+            return None
+
+        # 随机采样一个时间窗口
+        max_start_idx = len(targets) - self.seq_length - self.pred_length
+        if max_start_idx <= 0:
+            return None
+
+        start_idx = np.random.randint(0, max_start_idx)
+        end_idx = start_idx + self.seq_length
+
+        # 提取 RNN 输入序列
+        rnn_input = dynamic_features.iloc[start_idx:end_idx].values  # (seq_length, num_features)
+        rnn_input = torch.FloatTensor(rnn_input)
+
+        # 提取目标（预测窗口）
+        # 注意：targets 可能是 Series，需要确保对齐
+        target_values = targets.iloc[end_idx:end_idx + self.pred_length].values
+
+        # 如果 pred_length 不足，填充
+        if len(target_values) < self.pred_length:
+            padding = np.full(self.pred_length - len(target_values), np.nan)
+            target_values = np.concatenate([target_values, padding])
+
+        target = torch.FloatTensor(target_values)
+
+        # GNN 输入（静态图数据）
+        # static_features 是 PyG Data 对象
+        gnn_graph_data = static_features
+
+        return rnn_input, gnn_graph_data, target
+
+
+def collate_fn(batch):
+    """
+    自定义 collate 函数，用于处理 PyG Data 对象的批处理。
+    """
+    # 过滤掉 None 样本
+    batch = [item for item in batch if item is not None]
+
+    if len(batch) == 0:
+        return None, None, None
+
+    # 分离组件
+    rnn_inputs = [item[0] for item in batch]
+    gnn_graphs = [item[1] for item in batch]
+    targets = [item[2] for item in batch]
+
+    # 批处理 RNN 输入
+    rnn_batch = torch.stack(rnn_inputs)  # (batch_size, seq_length, num_features)
+
+    # 批处理 GNN 图数据
+    gnn_batch = Batch.from_data_list(gnn_graphs)
+
+    # 批处理目标
+    target_batch = torch.stack(targets)  # (batch_size, pred_length)
+
+    return rnn_batch, gnn_batch, target_batch
+
+
+# ==================== AdvancedModel Class ====================
 
 class AdvancedModel:
     """
@@ -39,169 +300,397 @@ class AdvancedModel:
     def __init__(self, model_params: dict, experiment_name: str = "my_advanced_model"):
         """
         初始化模型, 定义架构。
-        
+
         Args:
             model_params (dict): 包含超参数的字典 (e.g., learning_rate, layers)。
             experiment_name (str): 用于保存输出的实验名称。
         """
         self.params = model_params
-        self.model = None # TODO: 在此定义您的模型架构
         self.experiment_name = experiment_name
-        
+
+        # 提取超参数（带默认值）
+        self.static_feature_dim = model_params.get('static_feature_dim', 50)
+        self.dynamic_feature_dim = model_params.get('dynamic_feature_dim', 5)
+        self.gnn_hidden_dim = model_params.get('gnn_hidden_dim', 64)
+        self.rnn_hidden_dim = model_params.get('rnn_hidden_dim', 128)
+        self.rnn_num_layers = model_params.get('rnn_num_layers', 2)
+        self.rnn_type = model_params.get('rnn_type', 'lstm')
+        self.output_lead_times = model_params.get('output_lead_times', 10)
+        self.dropout = model_params.get('dropout', 0.2)
+        self.learning_rate = model_params.get('learning_rate', 0.001)
+        self.batch_size = model_params.get('batch_size', 32)
+        self.num_epochs = model_params.get('num_epochs', 50)
+        self.seq_length = model_params.get('seq_length', 365)
+        self.samples_per_gauge = model_params.get('samples_per_gauge', 10)
+
+        # 设置设备（GPU 或 CPU）
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+
+        # 初始化混合模型
+        self.model = HybridGNN_RNN(
+            static_feature_dim=self.static_feature_dim,
+            dynamic_feature_dim=self.dynamic_feature_dim,
+            gnn_hidden_dim=self.gnn_hidden_dim,
+            rnn_hidden_dim=self.rnn_hidden_dim,
+            rnn_num_layers=self.rnn_num_layers,
+            rnn_type=self.rnn_type,
+            output_lead_times=self.output_lead_times,
+            dropout=self.dropout
+        ).to(self.device)
+
+        # 初始化优化器
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+        # 初始化损失函数（使用 Huber Loss，对异常值更鲁棒）
+        self.criterion = nn.HuberLoss(delta=1.0)
+
         # [CRITICAL] 路径设置，基于 data_paths.py
         # 我们将新模型的输出保存在与 Google 模型相同的父目录中
         self.output_path = data_paths.GOOGLE_MODEL_RUNS_DIR.parent / self.experiment_name
-        
+        self.checkpoint_path = self.output_path / 'checkpoints'
+
         # 确保输出目录存在
         loading_utils.create_remote_folder_if_necessary(self.output_path)
-        
+        loading_utils.create_remote_folder_if_necessary(self.checkpoint_path)
+
         print(f"Initializing AdvancedModel for experiment: {self.experiment_name}")
         print(f"Model outputs will be saved to: {self.output_path}")
+        print(f"Model architecture: {self.model}")
 
-    def _prepare_data_for_gauge(self, gauge_id: str) -> (object, object):
+    def _prepare_data_for_gauge(self, gauge_id: str) -> tuple:
         """
-        一个辅助函数，用于为单个站点加载和预处理数据。
-        
+        为单个站点加载和预处理数据。
+
         Args:
             gauge_id (str): 站点ID (e.g., 'GRDC_1101101').
-            
+
         Returns:
-            (features, target): 可用于模型训练/预测的已处理数据。
+            (dynamic_features, static_graph_data, targets):
+                - dynamic_features: pd.DataFrame (time, dynamic_feature_dim) - 动态气象输入
+                - static_graph_data: PyG Data 对象 - 静态流域属性图
+                - targets: pd.Series (time,) - 观测径流
         """
-        print(f"Preparing data for {gauge_id}...")
-        
-        # TODO: 实现数据加载和特征工程
-        # 这是一个示例。您需要加载驱动数据（如气象数据）和观测数据
-        
-        # 1. 加载观测数据 (用于训练/验证)
-        # 您需要 GRDC 数据。确保已运行 `concatenate_grdc_downloads.ipynb`
-        # 并通过 `loading_utils.load_grdc_data()` 加载
-        
-        # 2. 加载驱动数据 (气象数据)
-        # 原始论文的驱动数据在 Zenodo 存储库中。
-        # 您需要自己实现这部分的数据加载逻辑，
-        # 因为 `loading_utils.py` 主要关注 *模型输出* 和 *GRDC*。
-        
-        # 3. 加载静态属性 (用于GNN或作为静态特征)
-        # static_attrs = loading_utils.load_attributes_file(gauges=[gauge_id])
-        
-        # 4. 特征工程
-        # features = ... (e.g., 气象数据 + 静态属性)
-        # targets = ... (e.g., 观测径流)
-        
-        # 模拟返回, 您需要替换它
-        # features = np.random.rand(1000, 10) # (time, features)
-        # targets = np.random.rand(1000, 1)  # (time, target)
-        
-        # 仅为示例:
         try:
+            # ===== 1. 加载观测数据 (目标) =====
             ds_grdc = loading_utils.load_grdc_data()
+
+            # 检查站点是否存在
+            if gauge_id not in ds_grdc.gauge_id.values:
+                print(f"Gauge {gauge_id} not found in GRDC data.")
+                return None, None, None
+
             ds_grdc_gauge = ds_grdc.sel(gauge_id=gauge_id)
-            targets = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].to_pandas()
-            
-            # 模拟特征 (应替换为真实的气象输入)
-            features = pd.DataFrame(
-                np.random.rand(len(targets), 5), 
-                index=targets.index,
-                columns=['precip', 'temp', 'PET', 'soil_moisture', 'snow']
+
+            # 提取观测径流（选择第一个前导时间作为目标，因为这是"同步"观测）
+            targets = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0).to_pandas()
+
+            # 清理无效值
+            targets = targets.replace([np.inf, -np.inf], np.nan)
+
+            # ===== 2. 加载静态流域属性 (用于 GNN) =====
+            try:
+                static_attrs_df = loading_utils.load_attributes_file(gauges=[gauge_id])
+
+                # 处理缺失值
+                static_attrs_df = static_attrs_df.fillna(static_attrs_df.mean())
+                static_attrs_df = static_attrs_df.fillna(0)  # 如果所有值都是 NaN
+
+                # 转换为 numpy 数组
+                static_features_array = static_attrs_df.values[0]  # (num_static_features,)
+
+                # 确保特征数量与模型匹配
+                if len(static_features_array) < self.static_feature_dim:
+                    # 如果特征不足，填充 0
+                    padding = np.zeros(self.static_feature_dim - len(static_features_array))
+                    static_features_array = np.concatenate([static_features_array, padding])
+                elif len(static_features_array) > self.static_feature_dim:
+                    # 如果特征过多，截断
+                    static_features_array = static_features_array[:self.static_feature_dim]
+
+            except Exception as e:
+                print(f"Warning: Could not load attributes for {gauge_id}: {e}")
+                print("Using random static features.")
+                static_features_array = np.random.randn(self.static_feature_dim)
+
+            # 标准化静态特征
+            static_features_array = (static_features_array - np.mean(static_features_array)) / (np.std(static_features_array) + 1e-8)
+
+            # ===== 3. 构建图数据（per-gauge：单节点图）=====
+            # 每个流域是一个单独的节点，没有边
+            x = torch.FloatTensor(static_features_array).unsqueeze(0)  # (1, static_feature_dim)
+            edge_index = torch.tensor([[], []], dtype=torch.long)  # 空边列表
+
+            static_graph_data = Data(x=x, edge_index=edge_index)
+
+            # ===== 4. 创建动态特征（气象输入）=====
+            # 注意：在实际应用中，这里应该加载真实的气象数据
+            # 由于示例中没有提供气象数据加载函数，我们创建模拟数据
+
+            # 创建与 targets 时间索引对齐的模拟气象数据
+            time_index = targets.index
+
+            # 模拟 5 个气象特征：降水、温度、潜在蒸散发、土壤湿度、积雪
+            np.random.seed(hash(gauge_id) % (2**32))  # 为每个站点设置可重复的随机种子
+
+            dynamic_features = pd.DataFrame(
+                {
+                    'precip': np.abs(np.random.randn(len(time_index)) * 5 + 2),  # 降水（非负）
+                    'temp': np.random.randn(len(time_index)) * 10 + 15,  # 温度
+                    'pet': np.abs(np.random.randn(len(time_index)) * 2 + 3),  # 潜在蒸散发
+                    'soil_moisture': np.random.rand(len(time_index)) * 0.5 + 0.2,  # 土壤湿度 [0.2, 0.7]
+                    'snow': np.abs(np.random.randn(len(time_index)) * 3),  # 积雪
+                },
+                index=time_index
             )
-            return features, targets
-            
+
+            # 确保特征数量与模型匹配
+            if dynamic_features.shape[1] != self.dynamic_feature_dim:
+                print(f"Warning: Dynamic features have {dynamic_features.shape[1]} columns, "
+                      f"but model expects {self.dynamic_feature_dim}. Adjusting...")
+
+                if dynamic_features.shape[1] < self.dynamic_feature_dim:
+                    # 添加额外的随机特征
+                    for i in range(self.dynamic_feature_dim - dynamic_features.shape[1]):
+                        dynamic_features[f'extra_{i}'] = np.random.randn(len(time_index))
+                else:
+                    # 截断
+                    dynamic_features = dynamic_features.iloc[:, :self.dynamic_feature_dim]
+
+            return dynamic_features, static_graph_data, targets
+
         except Exception as e:
             print(f"Error loading data for gauge {gauge_id}: {e}")
-            return None, None
+            import traceback
+            traceback.print_exc()
+            return None, None, None
 
 
     def train(self, training_gauge_ids: list[str]):
         """
         在提供的站点列表上训练模型。
-        
+
         Args:
             training_gauge_ids (list[str]): 用于训练的站点ID列表。
         """
         print(f"Starting training on {len(training_gauge_ids)} gauges...")
-        
-        # TODO: 实现您的训练循环
-        # 1. 设置 Dataset 和 DataLoader (如果使用 PyTorch/TF)
-        #    (您可能需要一个自定义的 Dataset 类来迭代 `training_gauge_ids`
-        #     并在 `__getitem__` 中调用 `_prepare_data_for_gauge`)
-        # 2. 迭代 epochs
-        # 3. 在每个 epoch 中, 迭代 (tqdm) Dataloader
-        # 4.   ... (执行前向和反向传播) ...
-        # 5. 保存模型检查点
-        
-        print("Training complete (simulation).")
+        print(f"Training for {self.num_epochs} epochs with batch size {self.batch_size}")
+
+        # ===== 1. 创建 Dataset 和 DataLoader =====
+        train_dataset = HydroDataset(
+            gauge_ids=training_gauge_ids,
+            data_preparation_fn=self._prepare_data_for_gauge,
+            seq_length=self.seq_length,
+            pred_length=self.output_lead_times,
+            samples_per_gauge=self.samples_per_gauge
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0  # 设置为 0 避免多进程问题
+        )
+
+        print(f"Dataset size: {len(train_dataset)} samples")
+
+        # ===== 2. 训练循环 =====
+        self.model.train()
+        best_loss = float('inf')
+
+        for epoch in range(self.num_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+
+            # 使用 tqdm 显示进度
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{self.num_epochs}')
+
+            for batch_idx, (rnn_input, gnn_input, targets) in enumerate(pbar):
+                # 跳过空批次
+                if rnn_input is None:
+                    continue
+
+                # 移动到设备
+                rnn_input = rnn_input.to(self.device)
+                gnn_input = gnn_input.to(self.device)
+                targets = targets.to(self.device)
+
+                # 前向传播
+                self.optimizer.zero_grad()
+                predictions = self.model(rnn_input, gnn_input)
+
+                # 计算损失（忽略 NaN 目标）
+                valid_mask = ~torch.isnan(targets)
+                if valid_mask.sum() == 0:
+                    continue  # 跳过全是 NaN 的批次
+
+                loss = self.criterion(predictions[valid_mask], targets[valid_mask])
+
+                # 反向传播
+                loss.backward()
+
+                # 梯度裁剪（避免梯度爆炸）
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                self.optimizer.step()
+
+                # 记录损失
+                epoch_loss += loss.item()
+                num_batches += 1
+
+                # 更新进度条
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+            # 计算平均 epoch 损失
+            avg_epoch_loss = epoch_loss / max(num_batches, 1)
+            print(f"Epoch {epoch+1}/{self.num_epochs} - Average Loss: {avg_epoch_loss:.4f}")
+
+            # ===== 3. 保存检查点 =====
+            # 每 10 个 epoch 或最后一个 epoch 保存
+            if (epoch + 1) % 10 == 0 or (epoch + 1) == self.num_epochs:
+                checkpoint_file = self.checkpoint_path / f'model_epoch_{epoch+1}.pth'
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': avg_epoch_loss,
+                }, checkpoint_file)
+                print(f"Checkpoint saved: {checkpoint_file}")
+
+            # 保存最佳模型
+            if avg_epoch_loss < best_loss:
+                best_loss = avg_epoch_loss
+                best_model_file = self.checkpoint_path / 'best_model.pth'
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': avg_epoch_loss,
+                }, best_model_file)
+                print(f"Best model updated: {best_model_file} (loss: {best_loss:.4f})")
+
+        print("Training complete!")
+        print(f"Best loss: {best_loss:.4f}")
 
     def predict(self, prediction_gauge_ids: list[str]) -> None:
         """
         为提供的站点列表生成预测，并保存为 NetCDF 文件。
-        
+
         这必须匹配 `loading_utils.load_google_model_for_one_gauge` 的输出格式，
         以确保与 `return_period_metrics.py` 兼容。
-        
+
         Args:
             prediction_gauge_ids (list[str]): 需要预测的站点ID列表。
         """
         print(f"Starting prediction on {len(prediction_gauge_ids)} gauges...")
-        
-        if self.model is None:
-            print("Warning: Model is not trained. Using random predictions.")
-            # self.model = torch.load('path/to/checkpoint.pth') # 加载模型
-            
-        for gauge_id in tqdm(prediction_gauge_ids):
-            
-            # 1. 准备该站点的数据
-            # features, _ = self._prepare_data_for_gauge(gauge_id)
-            # if features is None:
-            #     continue
-                
-            # TODO: 2. 运行模型推理
-            # predictions_array = self.model(features) # (time, lead_time)
-            
-            # --- 模拟预测 (TODO: 替换为真实预测) ---
-            # 我们需要模拟一个与原版 兼容的 xarray.Dataset
-            # [CRITICAL] 加载一个现有文件以获取其结构和坐标
+
+        # ===== 1. 加载最佳模型 =====
+        best_model_file = self.checkpoint_path / 'best_model.pth'
+        if best_model_file.exists():
+            print(f"Loading best model from {best_model_file}")
+            checkpoint = torch.load(best_model_file, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded model from epoch {checkpoint['epoch']} with loss {checkpoint['loss']:.4f}")
+        else:
+            print("Warning: No trained model found. Using randomly initialized model.")
+
+        self.model.eval()  # 设置为评估模式
+
+        # ===== 2. 为每个站点生成预测 =====
+        for gauge_id in tqdm(prediction_gauge_ids, desc='Generating predictions'):
+
+            # --- 2.1 准备该站点的数据 ---
+            dynamic_features, static_graph_data, targets = self._prepare_data_for_gauge(gauge_id)
+
+            if dynamic_features is None:
+                print(f"Skipping {gauge_id}: Could not load data.")
+                continue
+
+            # --- 2.2 加载模板以获取时间坐标 ---
             try:
-                # 使用 'full_run' 的一个站点作为坐标模板
-                #
                 ds_template = loading_utils.load_google_model_for_one_gauge(
-                    experiment='full_run', 
+                    experiment='full_run',
                     gauge=gauge_id
                 )
                 if ds_template is None:
-                    # 如果该站点在 'full_run' 中不存在, 尝试另一个
-                    ds_template = loading_utils.load_google_model_for_one_gauge(
-                        'full_run', 'GRDC_6335020' # 找一个已知存在的
-                    )
-                if ds_template is None:
-                     raise FileNotFoundError("Cannot load any template file.")
-                    
-            except FileNotFoundError:
-                print(f"Skipping {gauge_id}: Cannot load template file for structure.")
+                    print(f"Skipping {gauge_id}: Cannot load template file.")
+                    continue
+
+            except Exception as e:
+                print(f"Skipping {gauge_id}: Error loading template: {e}")
                 continue
 
-            # 创建模拟数据
-            # 确保 'time' 和 'lead_time' 坐标是相同的
-            # TODO: 您的模型输出需要对齐到 `ds_template['time']`
-            sim_data = np.random.rand(
-                len(ds_template['time']), 
-                len(ds_template['lead_time'])
+            # --- 2.3 运行模型推理（滑动窗口） ---
+            # 我们需要为模板中的每个时间步生成预测
+            target_times = ds_template['time'].values
+            target_lead_times = ds_template['lead_time'].values
+
+            # 初始化预测数组
+            predictions_array = np.full(
+                (len(target_times), len(target_lead_times)),
+                np.nan
             )
-            
-            # 3. [CRITICAL] 创建 xarray.Dataset
-            # 这必须与 `evaluation_utils` 和 
-            # `return_period_metrics` 兼容
-            
-            # 变量名必须是 'sim' (来自 metrics_utils.GOOGLE_VARIABLE) 
-            # 否则评估脚本 会失败
-            sim_variable_name = metrics_utils.GOOGLE_VARIABLE # "sim"
-            
+
+            # 清理数据（移除 NaN）
+            valid_mask = ~(dynamic_features.isna().any(axis=1) | targets.isna())
+            dynamic_features_clean = dynamic_features[valid_mask]
+            targets_clean = targets[valid_mask]
+
+            if len(dynamic_features_clean) < self.seq_length:
+                print(f"Skipping {gauge_id}: Insufficient data after cleaning.")
+                continue
+
+            # 滑动窗口预测
+            with torch.no_grad():
+                for i in range(len(dynamic_features_clean) - self.seq_length):
+                    # 提取输入序列
+                    rnn_input_seq = dynamic_features_clean.iloc[i:i+self.seq_length].values
+                    rnn_input_tensor = torch.FloatTensor(rnn_input_seq).unsqueeze(0).to(self.device)  # (1, seq_length, features)
+
+                    # 静态图数据
+                    gnn_input = static_graph_data.to(self.device)
+                    # 创建批次（单个样本）
+                    gnn_batch = Batch.from_data_list([gnn_input])
+
+                    # 前向传播
+                    pred = self.model(rnn_input_tensor, gnn_batch)  # (1, output_lead_times)
+                    pred_values = pred.cpu().numpy()[0]  # (output_lead_times,)
+
+                    # 确定预测时间（窗口结束后的时间）
+                    pred_time = dynamic_features_clean.index[i + self.seq_length]
+
+                    # 将预测映射到 target_times
+                    if pred_time in target_times:
+                        time_idx = np.where(target_times == pred_time)[0][0]
+
+                        # 填充前导时间（可能少于 output_lead_times）
+                        num_lead_times_to_fill = min(len(pred_values), len(target_lead_times))
+                        predictions_array[time_idx, :num_lead_times_to_fill] = pred_values[:num_lead_times_to_fill]
+
+            # --- 2.4 处理缺失预测（使用简单插值或填充） ---
+            # 对于没有预测的时间步，可以使用插值或填充策略
+            # 这里我们简单地保留 NaN（评估脚本会忽略它们）
+
+            # --- 2.5 创建 xarray.Dataset ---
+            # 注意：变量名需要与评估脚本兼容
+            # 根据模板代码，应该使用与原始 Google 模型相同的变量名
+            # 检查模板中的变量名
+            if 'sim' in ds_template.data_vars:
+                sim_variable_name = 'sim'
+            elif metrics_utils.GOOGLE_VARIABLE in ds_template.data_vars:
+                sim_variable_name = metrics_utils.GOOGLE_VARIABLE
+            else:
+                # 使用模板中的第一个变量名
+                sim_variable_name = list(ds_template.data_vars.keys())[0]
+                print(f"Warning: Using variable name '{sim_variable_name}' from template.")
+
             prediction_ds = xr.Dataset(
                 {
                     sim_variable_name: (
-                        ["time", "lead_time"], 
-                        sim_data,
-                        {'description': 'Simulated streamflow by my_advanced_model'}
+                        ["time", "lead_time"],
+                        predictions_array,
+                        {'description': f'Streamflow prediction by {self.experiment_name}'}
                     )
                 },
                 coords={
@@ -210,12 +699,133 @@ class AdvancedModel:
                     "gauge_id": gauge_id
                 }
             )
-            
-            # 4. 保存为 NetCDF 文件
+
+            # --- 2.6 保存为 NetCDF 文件 ---
             output_file_path = self.output_path / f'{gauge_id}.nc'
             try:
                 prediction_ds.to_netcdf(output_file_path)
             except Exception as e:
                 print(f"Error saving {gauge_id}.nc: {e}")
+                import traceback
+                traceback.print_exc()
 
         print(f"Predictions saved to {self.output_path}")
+        print("Prediction complete!")
+
+
+# ==================== Usage Example ====================
+
+if __name__ == "__main__":
+    """
+    使用示例：训练和预测 GNN-LSTM 混合模型
+    """
+
+    print("=" * 80)
+    print("GNN-LSTM Hybrid Model for Hydrological Prediction")
+    print("=" * 80)
+
+    # ===== 1. 定义模型超参数 =====
+    model_params = {
+        'static_feature_dim': 50,      # 静态流域属性维度（根据实际数据调整）
+        'dynamic_feature_dim': 5,      # 动态气象特征维度
+        'gnn_hidden_dim': 64,          # GNN 隐藏层维度
+        'rnn_hidden_dim': 128,         # RNN 隐藏层维度
+        'rnn_num_layers': 2,           # RNN 层数
+        'rnn_type': 'lstm',            # 'lstm' 或 'gru'
+        'output_lead_times': 10,       # 预测前导时间数量
+        'dropout': 0.2,                # Dropout 率
+        'learning_rate': 0.001,        # 学习率
+        'batch_size': 32,              # 批大小
+        'num_epochs': 50,              # 训练轮数
+        'seq_length': 365,             # RNN 输入序列长度（天）
+        'samples_per_gauge': 10,       # 每个站点的训练样本数
+    }
+
+    # ===== 2. 初始化模型 =====
+    model = AdvancedModel(
+        model_params=model_params,
+        experiment_name="gnn_lstm_hybrid_v1"
+    )
+
+    # ===== 3. 定义训练和测试站点 =====
+    # 注意：这里使用示例站点 ID，您需要替换为实际的站点列表
+    # 可以从 loading_utils.load_grdc_data() 获取可用站点列表
+
+    # 示例站点 ID（您需要替换为实际存在的站点）
+    try:
+        ds_grdc = loading_utils.load_grdc_data()
+        all_gauge_ids = ds_grdc.gauge_id.values.tolist()
+
+        print(f"\nTotal available gauges: {len(all_gauge_ids)}")
+
+        # 使用前 100 个站点进行训练（示例）
+        training_gauge_ids = all_gauge_ids[:100] if len(all_gauge_ids) >= 100 else all_gauge_ids[:len(all_gauge_ids)//2]
+
+        # 使用接下来的 20 个站点进行预测（示例）
+        prediction_gauge_ids = all_gauge_ids[100:120] if len(all_gauge_ids) >= 120 else all_gauge_ids[len(all_gauge_ids)//2:]
+
+        print(f"Training gauges: {len(training_gauge_ids)}")
+        print(f"Prediction gauges: {len(prediction_gauge_ids)}")
+
+    except Exception as e:
+        print(f"Error loading gauge IDs: {e}")
+        print("Using dummy gauge IDs for demonstration.")
+        training_gauge_ids = ['GRDC_6335020', 'GRDC_6335075']
+        prediction_gauge_ids = ['GRDC_6335020']
+
+    # ===== 4. 训练模型 =====
+    print("\n" + "=" * 80)
+    print("TRAINING PHASE")
+    print("=" * 80)
+
+    # 取消下面的注释以启动训练
+    # model.train(training_gauge_ids)
+
+    # ===== 5. 生成预测 =====
+    print("\n" + "=" * 80)
+    print("PREDICTION PHASE")
+    print("=" * 80)
+
+    # 取消下面的注释以生成预测
+    # model.predict(prediction_gauge_ids)
+
+    # ===== 6. 评估模型 =====
+    print("\n" + "=" * 80)
+    print("EVALUATION")
+    print("=" * 80)
+    print("""
+    预测完成后，您可以使用以下 Notebooks 评估模型性能：
+
+    1. 标准指标（NSE, KGE, etc.）:
+       - notebooks/calculate_hydrograph_metrics.ipynb
+
+    2. 极端事件指标（重现期）:
+       - notebooks/calculate_return_period_metrics.ipynb
+
+    确保在评估脚本中将 experiment 参数设置为您的模型名称：
+       experiment = 'gnn_lstm_hybrid_v1'
+    """)
+
+    print("=" * 80)
+    print("示例完成！")
+    print("=" * 80)
+
+    print("""
+    注意事项：
+    1. 本实现使用模拟的气象数据。在实际应用中，您需要：
+       - 在 _prepare_data_for_gauge 方法中加载真实的气象驱动数据
+       - 确保气象数据与 GRDC 观测数据的时间索引对齐
+
+    2. 模型超参数需要根据您的数据和任务进行调优：
+       - seq_length: 根据流域的响应时间调整
+       - rnn_hidden_dim, gnn_hidden_dim: 根据数据复杂度调整
+       - learning_rate, batch_size: 根据训练表现调整
+
+    3. 静态特征维度 (static_feature_dim) 应该与：
+       loading_utils.load_attributes_file() 返回的列数匹配
+
+    4. 训练可能需要大量时间和计算资源（GPU 推荐）
+
+    5. 预测输出格式已与原始评估框架兼容，可以直接使用
+       calculate_return_period_metrics.ipynb 进行评估
+    """)
