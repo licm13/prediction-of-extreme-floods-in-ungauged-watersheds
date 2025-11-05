@@ -404,7 +404,7 @@ def kge(
     sim: DataArray,
     weights: List[float] = _UNIFORM_WEIGHTS
 ) -> float:
-  """Calculate the Kling-Gupta Efficieny.
+  """Calculate the Kling-Gupta Efficiency.
 
   Args:
     obs: Observed time series.
@@ -432,7 +432,7 @@ def log_kge(
     sim: DataArray,
     weights: List[float] = _UNIFORM_WEIGHTS
 ) -> float:
-  """Calculate the Kling-Gupta Efficieny on log-transformed values.
+  """Calculate the Kling-Gupta Efficiency on log-transformed values.
 
   Args:
     obs: Observed time series.
