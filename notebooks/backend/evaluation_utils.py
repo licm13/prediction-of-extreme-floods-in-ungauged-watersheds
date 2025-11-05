@@ -185,17 +185,15 @@ def plot_cdf(
     # Make the CDF
     x_data, y_data = _empirical_cdf(x=scores)
 
-    # Plot the CDF
+    # Build plot kwargs dynamically to avoid redundant conditionals
+    plot_kwargs = {'lw': lw, 'ls': ls, 'alpha': alpha}
     if color is not None:
-        if label is not None:
-            ax.plot(x_data, y_data, label=label, lw=lw, c=color, ls=ls, alpha=alpha)
-        else:
-            ax.plot(x_data, y_data, lw=lw, c=color, ls=ls, alpha=alpha)
-    else:
-        if label is not None:
-            ax.plot(x_data, y_data, label=label, lw=lw, ls=ls, alpha=alpha)
-        else:
-            ax.plot(x_data, y_data, lw=lw, ls=ls, alpha=alpha)
+        plot_kwargs['c'] = color
+    if label is not None:
+        plot_kwargs['label'] = label
+    
+    # Plot the CDF with consolidated parameters
+    ax.plot(x_data, y_data, **plot_kwargs)
 
     # Aesthetics
     if legend:
@@ -211,7 +209,8 @@ def plot_cdf(
 def _empirical_cdf(x: np.ndarray):
     """Calculates empirical cumulative density function."""
     xs = np.sort(np.squeeze(x))
-    ys = np.array(range(len(x))) / len(x)
+    # Use arange instead of range for efficiency with large arrays
+    ys = np.arange(len(x)) / len(x)
     return xs, ys
 
 
