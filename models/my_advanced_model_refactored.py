@@ -8,13 +8,17 @@ This refactored version:
 4. Provides better model evaluation capabilities
 """
 
-import pandas as pd
-import xarray as xr
-import numpy as np
+import json
 import os
 import sys
+from datetime import datetime
+from typing import Optional, Dict, Tuple, List
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
 from tqdm import tqdm
-from typing import Optional, Dict, Tuple
 import pathlib
 
 # Ensure backend is in path
@@ -28,6 +32,8 @@ try:
     from backend import data_paths
     from backend import metrics_utils
     from backend import metrics
+    from backend.return_period_calculator import return_period_calculator
+    from backend.return_period_calculator import exceptions as rpc_exceptions
 except ImportError:
     print("Error: Could not import from notebooks/backend.")
     sys.exit(1)
@@ -284,6 +290,17 @@ class AdvancedModel:
         self.num_epochs = model_params.get('num_epochs', 50)
         self.seq_length = model_params.get('seq_length', 365)
         self.samples_per_gauge = model_params.get('samples_per_gauge', 10)
+        self.validation_interval = model_params.get('validation_interval', 5)
+        self.validation_metrics = [
+            metric for metric in model_params.get(
+                'validation_metrics', ['nse', 'kge', 'rmse']
+            )
+        ]
+        self.prediction_metrics = [
+            metric for metric in model_params.get(
+                'prediction_metrics', ['nse', 'kge', 'rmse', 'pearson-r']
+            )
+        ]
 
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -322,10 +339,23 @@ class AdvancedModel:
         self.output_path = data_paths.GOOGLE_MODEL_RUNS_DIR.parent / self.experiment_name
         self.checkpoint_path = self.output_path / 'checkpoints'
         self.metrics_path = self.output_path / 'metrics'
+        self.predictions_path = self.output_path / 'predictions'
+        self.evaluation_path = self.output_path / 'evaluation'
+        self.figures_path = self.evaluation_path / 'figures'
+        self.extreme_tables_path = self.evaluation_path / 'extreme_tables'
+        self.metadata_path = self.output_path / 'metadata'
 
-        loading_utils.create_remote_folder_if_necessary(self.output_path)
-        loading_utils.create_remote_folder_if_necessary(self.checkpoint_path)
-        loading_utils.create_remote_folder_if_necessary(self.metrics_path)
+        for path in [
+            self.output_path,
+            self.checkpoint_path,
+            self.metrics_path,
+            self.predictions_path,
+            self.evaluation_path,
+            self.figures_path,
+            self.extreme_tables_path,
+            self.metadata_path,
+        ]:
+            loading_utils.create_remote_folder_if_necessary(path)
 
         print(f"Initialized AdvancedModel: {self.experiment_name}")
         print(f"Outputs: {self.output_path}")
@@ -390,6 +420,7 @@ class AdvancedModel:
         self.model.train()
         best_loss = float('inf')
         training_history = {'train_loss': [], 'val_loss': []}
+        validation_metric_history: List[Dict[str, float]] = []
 
         for epoch in range(self.num_epochs):
             epoch_loss = 0.0
@@ -435,6 +466,18 @@ class AdvancedModel:
             else:
                 print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}")
 
+            if val_loader is not None and ((epoch + 1) % max(self.validation_interval, 1) == 0):
+                validation_metrics = self._compute_validation_metrics(val_loader)
+                if validation_metrics:
+                    metrics_with_epoch = {'epoch': epoch + 1}
+                    metrics_with_epoch.update(validation_metrics)
+                    validation_metric_history.append(metrics_with_epoch)
+                    formatted_metrics = ", ".join(
+                        f"{key}: {value:.4f}" if value is not None else f"{key}: NaN"
+                        for key, value in validation_metrics.items()
+                    )
+                    print(f"Validation metrics at epoch {epoch+1}: {formatted_metrics}")
+
             # Save checkpoint
             if (epoch + 1) % 10 == 0 or (epoch + 1) == self.num_epochs:
                 self._save_checkpoint(epoch + 1, avg_train_loss)
@@ -449,8 +492,27 @@ class AdvancedModel:
         history_df = pd.DataFrame(training_history)
         history_df.to_csv(self.metrics_path / 'training_history.csv', index=False)
 
+        if validation_metric_history:
+            validation_df = pd.DataFrame(validation_metric_history)
+            validation_df.to_csv(self.metrics_path / 'validation_metrics.csv', index=False)
+
         print("Training complete!")
         print(f"Best loss: {best_loss:.4f}")
+
+        training_metadata = {
+            'experiment_name': self.experiment_name,
+            'created_at': datetime.utcnow().isoformat() + 'Z',
+            'params': self.params,
+            'best_loss': best_loss,
+            'training_history': history_df.to_dict(orient='list'),
+            'validation_metrics': validation_metric_history,
+        }
+        if validation_metric_history:
+            training_metadata['validation_metrics_file'] = os.path.relpath(
+                self.metrics_path / 'validation_metrics.csv',
+                self.output_path,
+            )
+        self._write_metadata_file('training_run.json', training_metadata)
 
     def _evaluate(self, data_loader) -> float:
         """Evaluate model on a dataset."""
@@ -480,6 +542,76 @@ class AdvancedModel:
         self.model.train()
         return total_loss / max(num_batches, 1)
 
+    def _compute_validation_metrics(self, data_loader) -> Dict[str, float]:
+        """Run inference on the validation loader and compute summary metrics."""
+        self.model.eval()
+        preds: List[torch.Tensor] = []
+        trues: List[torch.Tensor] = []
+
+        with torch.no_grad():
+            for rnn_input, gnn_input, targets in data_loader:
+                if rnn_input is None:
+                    continue
+
+                rnn_input = rnn_input.to(self.device)
+                gnn_input = gnn_input.to(self.device)
+                targets = targets.to(self.device)
+
+                batch_predictions = self.model(rnn_input, gnn_input)
+                valid_mask = ~torch.isnan(targets)
+                if valid_mask.sum() == 0:
+                    continue
+
+                preds.append(batch_predictions[valid_mask].detach().cpu())
+                trues.append(targets[valid_mask].detach().cpu())
+
+        self.model.train()
+
+        if not preds:
+            return {}
+
+        concatenated_preds = torch.cat(preds)
+        concatenated_trues = torch.cat(trues)
+
+        if concatenated_preds.numel() == 0:
+            return {}
+
+        coords = np.arange(concatenated_preds.numel())
+        sim_da = xr.DataArray(
+            concatenated_preds.numpy(),
+            dims=['time'],
+            coords={'time': coords},
+        )
+        obs_da = xr.DataArray(
+            concatenated_trues.numpy(),
+            dims=['time'],
+            coords={'time': coords},
+        )
+
+        try:
+            metric_values = metrics.calculate_metrics(
+                obs=obs_da,
+                sim=sim_da,
+                metrics=self.validation_metrics,
+                resolution='1D',
+                datetime_coord='time',
+                minimum_data_points=len(coords),
+            )
+        except RuntimeError as err:
+            print(f"Validation metric computation failed: {err}")
+            return {}
+
+        sanitized_metrics: Dict[str, float] = {}
+        for key, value in metric_values.items():
+            if value is None:
+                sanitized_metrics[key] = None
+            elif isinstance(value, float):
+                sanitized_metrics[key] = float(value) if not np.isnan(value) else None
+            else:
+                sanitized_metrics[key] = float(value)
+
+        return sanitized_metrics
+
     def _save_checkpoint(self, epoch: int, loss: float):
         """Save model checkpoint."""
         checkpoint_file = self.checkpoint_path / f'model_epoch_{epoch}.pth'
@@ -504,7 +636,7 @@ class AdvancedModel:
 
     def predict(self, prediction_gauge_ids: list[str]) -> None:
         """
-        Generate predictions and save as NetCDF files.
+        Generate predictions, save NetCDF files, and run evaluation routines.
 
         Args:
             prediction_gauge_ids: List of gauge IDs to predict
@@ -522,15 +654,18 @@ class AdvancedModel:
 
         self.model.eval()
 
+        hydro_metrics_records: List[Dict[str, float]] = []
+        extreme_metrics_records: List[Dict[str, float]] = []
+        extreme_assets: List[Dict[str, str]] = []
+        processed_gauges = 0
+
         for gauge_id in tqdm(prediction_gauge_ids, desc='Generating predictions'):
-            # Prepare data
             dynamic_features, static_features, targets = self.data_loader.prepare_data_for_gauge(gauge_id)
 
             if dynamic_features is None:
                 print(f"Skipping {gauge_id}: Could not load data")
                 continue
 
-            # Load template for time coordinates
             try:
                 ds_template = loading_utils.load_google_model_for_one_gauge(
                     experiment='full_run',
@@ -539,19 +674,98 @@ class AdvancedModel:
                 if ds_template is None:
                     print(f"Skipping {gauge_id}: Cannot load template")
                     continue
-            except:
-                print(f"Skipping {gauge_id}: Error loading template")
+            except Exception as err:
+                print(f"Skipping {gauge_id}: Error loading template ({err})")
                 continue
 
-            # Run inference
             predictions_array = self._run_inference_for_gauge(
                 dynamic_features, static_features, targets, ds_template
             )
 
-            # Save predictions
-            self._save_predictions_netcdf(gauge_id, predictions_array, ds_template)
+            prediction_ds = self._save_predictions_netcdf(
+                gauge_id, predictions_array, ds_template
+            )
+            processed_gauges += 1
 
-        print(f"Predictions saved to {self.output_path}")
+            gauge_metrics = self._calculate_prediction_metrics(prediction_ds, gauge_id)
+            if gauge_metrics is not None:
+                hydro_metrics_records.append(gauge_metrics)
+
+            extremes_result = self._evaluate_extremes_from_dataset(prediction_ds, gauge_id)
+            if extremes_result is not None:
+                extreme_metrics_records.append(
+                    {'gauge_id': gauge_id, **extremes_result['metrics']}
+                )
+                extreme_assets.append({
+                    'gauge_id': gauge_id,
+                    'table': os.path.relpath(extremes_result['table_path'], self.output_path),
+                    'figure': os.path.relpath(extremes_result['figure_path'], self.output_path),
+                })
+
+        hydro_metrics_file = None
+        hydro_metrics_json = None
+        if hydro_metrics_records:
+            hydro_metrics_df = pd.DataFrame(hydro_metrics_records).set_index('gauge_id')
+            hydro_metrics_file = self.evaluation_path / 'hydrograph_metrics.csv'
+            hydro_metrics_df.to_csv(hydro_metrics_file)
+            hydro_metrics_json = self.evaluation_path / 'hydrograph_metrics.json'
+            with open(hydro_metrics_json, 'w') as f:
+                json.dump(
+                    self._serialize_for_json(hydro_metrics_df.to_dict(orient='index')),
+                    f,
+                    indent=2,
+                )
+
+        extreme_metrics_file = None
+        extreme_metrics_json = None
+        if extreme_metrics_records:
+            extreme_metrics_df = pd.DataFrame(extreme_metrics_records).set_index('gauge_id')
+            extreme_metrics_file = self.evaluation_path / 'extreme_metrics.csv'
+            extreme_metrics_df.to_csv(extreme_metrics_file)
+            extreme_metrics_json = self.evaluation_path / 'extreme_metrics.json'
+            with open(extreme_metrics_json, 'w') as f:
+                json.dump(
+                    self._serialize_for_json(extreme_metrics_df.to_dict(orient='index')),
+                    f,
+                    indent=2,
+                )
+
+        evaluation_metadata: Dict[str, object] = {
+            'experiment_name': self.experiment_name,
+            'generated_at': datetime.utcnow().isoformat() + 'Z',
+            'gauges_requested': len(prediction_gauge_ids),
+            'gauges_predicted': processed_gauges,
+            'prediction_directory': os.path.relpath(
+                self.predictions_path, self.output_path
+            ),
+        }
+
+        if hydro_metrics_file is not None:
+            evaluation_metadata['hydrograph_metrics_file'] = os.path.relpath(
+                hydro_metrics_file, self.output_path
+            )
+        if hydro_metrics_json is not None:
+            evaluation_metadata['hydrograph_metrics_json'] = os.path.relpath(
+                hydro_metrics_json, self.output_path
+            )
+        if extreme_metrics_file is not None:
+            evaluation_metadata['extreme_metrics_file'] = os.path.relpath(
+                extreme_metrics_file, self.output_path
+            )
+        if extreme_metrics_json is not None:
+            evaluation_metadata['extreme_metrics_json'] = os.path.relpath(
+                extreme_metrics_json, self.output_path
+            )
+        if extreme_assets:
+            evaluation_metadata['extreme_assets'] = extreme_assets
+
+        self._write_metadata_file('evaluation_summary.json', evaluation_metadata)
+
+        print(f"Predictions saved to {self.predictions_path}")
+        if hydro_metrics_file is not None:
+            print(f"Hydrograph metrics saved to {hydro_metrics_file}")
+        if extreme_metrics_file is not None:
+            print(f"Extreme metrics saved to {extreme_metrics_file}")
 
     def _run_inference_for_gauge(self, dynamic_features, static_features, targets, ds_template):
         """Run model inference for a gauge."""
@@ -594,31 +808,224 @@ class AdvancedModel:
         return predictions_array
 
     def _save_predictions_netcdf(self, gauge_id, predictions_array, ds_template):
-        """Save predictions as NetCDF file."""
-        if 'sim' in ds_template.data_vars:
-            sim_variable_name = 'sim'
-        elif metrics_utils.GOOGLE_VARIABLE in ds_template.data_vars:
-            sim_variable_name = metrics_utils.GOOGLE_VARIABLE
-        else:
-            sim_variable_name = list(ds_template.data_vars.keys())[0]
+        """Save predictions as NetCDF file and return the dataset."""
+        prediction_ds = ds_template.copy(deep=True)
 
-        prediction_ds = xr.Dataset(
-            {
-                sim_variable_name: (
-                    ["time", "lead_time"],
-                    predictions_array,
-                    {'description': f'Streamflow prediction by {self.experiment_name}'}
-                )
-            },
+        sim_variable_name = self._get_simulation_variable_name(prediction_ds)
+        prediction_ds[sim_variable_name] = xr.DataArray(
+            predictions_array.astype(np.float32),
+            dims=('time', 'lead_time'),
             coords={
-                "time": ds_template['time'],
-                "lead_time": ds_template['lead_time'],
-                "gauge_id": gauge_id
+                'time': prediction_ds['time'],
+                'lead_time': prediction_ds['lead_time'],
+            },
+            attrs={'description': f'Streamflow prediction by {self.experiment_name}'},
+        )
+
+        prediction_ds = prediction_ds.assign_coords({'gauge_id': gauge_id})
+        if prediction_ds.attrs is None:
+            prediction_ds.attrs = {}
+        prediction_ds.attrs['model_id'] = self.experiment_name
+        prediction_ds.attrs['generated_at'] = datetime.utcnow().isoformat() + 'Z'
+
+        output_file_path = self.predictions_path / f'{gauge_id}.nc'
+        prediction_ds.to_netcdf(output_file_path)
+
+        return prediction_ds
+
+    def _get_simulation_variable_name(self, dataset: xr.Dataset) -> str:
+        if metrics_utils.GOOGLE_VARIABLE in dataset.data_vars:
+            return metrics_utils.GOOGLE_VARIABLE
+        if 'sim' in dataset.data_vars:
+            return 'sim'
+        return list(dataset.data_vars.keys())[0]
+
+    def _calculate_prediction_metrics(
+        self, dataset: xr.Dataset, gauge_id: str
+    ) -> Optional[Dict[str, float]]:
+        if metrics_utils.OBS_VARIABLE not in dataset.data_vars:
+            print(f"Dataset for {gauge_id} is missing observations; skipping metrics.")
+            return None
+
+        sim_variable_name = self._get_simulation_variable_name(dataset)
+        sim = dataset[sim_variable_name]
+        obs = dataset[metrics_utils.OBS_VARIABLE]
+
+        if 'lead_time' in sim.dims:
+            sim = sim.sel(lead_time=0).squeeze(drop=True)
+        if 'lead_time' in obs.dims:
+            obs = obs.sel(lead_time=0).squeeze(drop=True)
+
+        try:
+            metric_values = metrics.calculate_metrics(
+                obs=obs,
+                sim=sim,
+                metrics=self.prediction_metrics,
+                resolution='1D',
+                datetime_coord='time',
+            )
+        except RuntimeError as err:
+            print(f"Could not compute metrics for {gauge_id}: {err}")
+            return None
+
+        sanitized_metrics: Dict[str, float] = {}
+        for key, value in metric_values.items():
+            if value is None:
+                sanitized_metrics[key] = None
+            elif isinstance(value, float):
+                sanitized_metrics[key] = float(value) if not np.isnan(value) else None
+            else:
+                sanitized_metrics[key] = float(value)
+
+        sanitized_metrics['gauge_id'] = gauge_id
+        return sanitized_metrics
+
+    def _evaluate_extremes_from_dataset(
+        self, dataset: xr.Dataset, gauge_id: str
+    ) -> Optional[Dict[str, object]]:
+        if metrics_utils.OBS_VARIABLE not in dataset.data_vars:
+            return None
+
+        sim_variable_name = self._get_simulation_variable_name(dataset)
+        sim = dataset[sim_variable_name]
+        obs = dataset[metrics_utils.OBS_VARIABLE]
+
+        if 'lead_time' in sim.dims:
+            sim = sim.sel(lead_time=0).squeeze(drop=True)
+        if 'lead_time' in obs.dims:
+            obs = obs.sel(lead_time=0).squeeze(drop=True)
+
+        sim_series = sim.to_pandas().dropna()
+        obs_series = obs.to_pandas().dropna()
+
+        if sim_series.empty or obs_series.empty:
+            return None
+
+        evaluation = self.evaluate_extremes(gauge_id, obs_series, sim_series)
+        return evaluation
+
+    def evaluate_extremes(
+        self,
+        gauge_id: str,
+        obs_series: pd.Series,
+        sim_series: pd.Series,
+        return_periods: Optional[np.ndarray] = None,
+    ) -> Optional[Dict[str, object]]:
+        """Evaluate extreme-flow behaviour and persist diagnostics."""
+        obs_series = obs_series.sort_index()
+        sim_series = sim_series.sort_index()
+
+        common_index = obs_series.index.intersection(sim_series.index)
+        if len(common_index) < 2:
+            return None
+
+        obs_series = obs_series.loc[common_index]
+        sim_series = sim_series.loc[common_index]
+
+        temporal_resolution = self._infer_temporal_resolution(common_index)
+
+        try:
+            obs_rpc = return_period_calculator.ReturnPeriodCalculator(
+                hydrograph_series=obs_series,
+                hydrograph_series_frequency=temporal_resolution,
+                use_simple_fitting=True,
+                verbose=False,
+            )
+            sim_rpc = return_period_calculator.ReturnPeriodCalculator(
+                hydrograph_series=sim_series,
+                hydrograph_series_frequency=temporal_resolution,
+                use_simple_fitting=True,
+                verbose=False,
+            )
+        except rpc_exceptions.NotEnoughDataError:
+            print(f"Not enough data to compute return periods for {gauge_id}.")
+            return None
+
+        if return_periods is None:
+            return_periods = np.array([2, 5, 10, 20, 50, 100])
+
+        obs_flows = obs_rpc.flow_values_from_return_periods(return_periods)
+        sim_flows = sim_rpc.flow_values_from_return_periods(return_periods)
+        bias = sim_flows - obs_flows
+        with np.errstate(divide='ignore', invalid='ignore'):
+            relative_bias = np.where(obs_flows != 0, (bias / obs_flows) * 100.0, np.nan)
+
+        table = pd.DataFrame(
+            {
+                'return_period': return_periods,
+                'observed_flow': obs_flows,
+                'predicted_flow': sim_flows,
+                'bias': bias,
+                'relative_bias_pct': relative_bias,
             }
         )
 
-        output_file_path = self.output_path / f'{gauge_id}.nc'
-        prediction_ds.to_netcdf(output_file_path)
+        table_path = self.extreme_tables_path / f'{gauge_id}_return_periods.csv'
+        table.to_csv(table_path, index=False)
+
+        peak_obs = obs_series.max()
+        peak_sim = sim_series.max()
+        peak_bias = float(peak_sim - peak_obs)
+        peak_relative_bias = float((peak_bias / peak_obs) * 100.0) if peak_obs != 0 else np.nan
+
+        metrics_summary: Dict[str, float] = {
+            'peak_bias': peak_bias,
+            'peak_relative_bias_pct': None if np.isnan(peak_relative_bias) else peak_relative_bias,
+        }
+
+        for rp, rp_bias, rp_rel_bias in zip(return_periods, bias, relative_bias):
+            metrics_summary[f'return_period_{int(rp)}_bias'] = float(rp_bias)
+            metrics_summary[f'return_period_{int(rp)}_relative_bias_pct'] = (
+                None if np.isnan(rp_rel_bias) else float(rp_rel_bias)
+            )
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(return_periods, obs_flows, marker='o', label='Observed')
+        ax.plot(return_periods, sim_flows, marker='o', label='Predicted')
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel('Return period (years)')
+        ax.set_ylabel('Flow')
+        ax.set_title(f'Return-period curves for {gauge_id}')
+        ax.grid(True, which='both', linestyle='--', alpha=0.5)
+        ax.legend()
+
+        figure_path = self.figures_path / f'{gauge_id}_return_period_curve.png'
+        fig.savefig(figure_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        return {
+            'metrics': metrics_summary,
+            'table_path': table_path,
+            'figure_path': figure_path,
+        }
+
+    def _infer_temporal_resolution(self, index: pd.Index) -> pd.Timedelta:
+        if len(index) < 2:
+            return pd.to_timedelta('1D')
+        diffs = np.diff(index.values.astype('datetime64[ns]'))
+        median_diff = np.median(diffs)
+        return pd.to_timedelta(median_diff)
+
+    def _write_metadata_file(self, filename: str, content: Dict[str, object]) -> None:
+        metadata_file = self.metadata_path / filename
+        with open(metadata_file, 'w') as f:
+            json.dump(self._serialize_for_json(content), f, indent=2)
+
+    def _serialize_for_json(self, value):
+        if isinstance(value, dict):
+            return {key: self._serialize_for_json(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [self._serialize_for_json(item) for item in value]
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        if isinstance(value, (np.bool_, bool)):
+            return bool(value)
+        if isinstance(value, (pd.Timestamp, np.datetime64)):
+            return pd.to_datetime(value).isoformat()
+        if isinstance(value, pathlib.Path):
+            return str(value)
+        return value
 
     def evaluate_predictions(self, gauge_ids: list[str], lead_time: int = 0) -> pd.DataFrame:
         """
@@ -638,7 +1045,7 @@ class AdvancedModel:
         for gauge_id in tqdm(gauge_ids, desc='Evaluating'):
             try:
                 # Load prediction
-                pred_file = self.output_path / f'{gauge_id}.nc'
+                pred_file = self.predictions_path / f'{gauge_id}.nc'
                 if not pred_file.exists():
                     continue
 
@@ -676,8 +1083,9 @@ class AdvancedModel:
         results_df.set_index('gauge_id', inplace=True)
 
         # Save results
-        results_df.to_csv(self.metrics_path / f'evaluation_metrics_lead{lead_time}.csv')
-        print(f"Evaluation results saved to {self.metrics_path}")
+        output_file = self.evaluation_path / f'evaluation_metrics_lead{lead_time}.csv'
+        results_df.to_csv(output_file)
+        print(f"Evaluation results saved to {output_file}")
 
         return results_df
 
