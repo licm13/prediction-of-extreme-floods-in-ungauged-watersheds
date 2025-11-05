@@ -375,7 +375,7 @@ def _calculate_kge_components(
     sim: DataArray,
     weights: List[float]
 ) -> float:
-  """Helper function to calculate KGE from correlation, alpha, and beta.
+  """Helper function to calculate KGE from correlation, alpha_ratio, and beta_ratio.
   
   Args:
     obs: Observed time series (already validated and masked).
