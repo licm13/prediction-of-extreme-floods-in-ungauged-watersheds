@@ -4,6 +4,7 @@ import xarray as xr
 import numpy as np
 import os
 import sys
+from typing import Optional
 from tqdm import tqdm
 
 # 确保 backend 在路径中，以便可以从 models/ 目录导入
@@ -34,6 +35,7 @@ import torch_geometric
 from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader as GeometricDataLoader
+from torch_geometric.utils import k_hop_subgraph
 
 
 # ==================== Model Architecture ====================
@@ -130,19 +132,29 @@ class HybridGNN_RNN(nn.Module):
         batch_idx = static_graph_batch.batch
 
         # GNN 层
-        x_static = self.gnn_conv1(x_static, edge_index)
+        edge_weight = getattr(static_graph_batch, 'edge_weight', None)
+
+        x_static = self.gnn_conv1(x_static, edge_index, edge_weight)
         x_static = self.gnn_bn1(x_static)
         x_static = self.relu(x_static)
         x_static = self.dropout(x_static)
 
-        x_static = self.gnn_conv2(x_static, edge_index)
+        x_static = self.gnn_conv2(x_static, edge_index, edge_weight)
         x_static = self.gnn_bn2(x_static)
         x_static = self.relu(x_static)
 
-        # 由于每个图只有一个节点（per-gauge），直接使用节点特征
-        # 如果需要聚合多个节点，可以使用: x_static = global_mean_pool(x_static, batch_idx)
-        # 但在我们的情况下，每个样本只有一个节点
-        gnn_embedding = x_static  # (batch_size, gnn_hidden_dim)
+        # 提取目标节点的嵌入（每个图一个目标节点）
+        if hasattr(static_graph_batch, 'target_mask'):
+            target_mask = static_graph_batch.target_mask
+            if target_mask.dtype != torch.bool:
+                target_mask = target_mask.bool()
+            gnn_embedding = x_static[target_mask]
+        else:
+            gnn_embedding = global_mean_pool(x_static, batch_idx)
+
+        # 如果掩码提取失败（例如缺失目标节点），退化为图级平均
+        if gnn_embedding.shape[0] != dynamic_features.shape[0]:
+            gnn_embedding = global_mean_pool(x_static, batch_idx)
 
         # ===== RNN 部分 =====
         # 处理动态时间序列
@@ -309,7 +321,7 @@ class AdvancedModel:
         self.experiment_name = experiment_name
 
         # 提取超参数（带默认值）
-        self.static_feature_dim = model_params.get('static_feature_dim', 50)
+        self.config_static_feature_dim = model_params.get('static_feature_dim', 50)
         self.dynamic_feature_dim = model_params.get('dynamic_feature_dim', 5)
         self.gnn_hidden_dim = model_params.get('gnn_hidden_dim', 64)
         self.rnn_hidden_dim = model_params.get('rnn_hidden_dim', 128)
@@ -322,6 +334,20 @@ class AdvancedModel:
         self.num_epochs = model_params.get('num_epochs', 50)
         self.seq_length = model_params.get('seq_length', 365)
         self.samples_per_gauge = model_params.get('samples_per_gauge', 10)
+        self.graph_hops = model_params.get('graph_hops', 2)
+
+        # 初始化图结构
+        self.global_graph_data = None
+        self.gauge_to_node_idx = {}
+        self.hybas_id_to_node_idx = {}
+        self.base_static_feature_dim = self.config_static_feature_dim
+
+        global_feature_dim = self._initialize_global_graph()
+        if global_feature_dim is not None:
+            self.base_static_feature_dim = global_feature_dim
+
+        # 节点特征额外包含目标指示器
+        self.static_feature_dim = self.base_static_feature_dim + 1
 
         # 设置设备（GPU 或 CPU）
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -399,29 +425,22 @@ class AdvancedModel:
                 # 转换为 numpy 数组
                 static_features_array = static_attrs_df.values[0]  # (num_static_features,)
 
-                # 确保特征数量与模型匹配
-                if len(static_features_array) < self.static_feature_dim:
-                    # 如果特征不足，填充 0
-                    padding = np.zeros(self.static_feature_dim - len(static_features_array))
+                # 确保特征数量与模型匹配（不含目标指示器）
+                if len(static_features_array) < self.base_static_feature_dim:
+                    padding = np.zeros(self.base_static_feature_dim - len(static_features_array))
                     static_features_array = np.concatenate([static_features_array, padding])
-                elif len(static_features_array) > self.static_feature_dim:
-                    # 如果特征过多，截断
-                    static_features_array = static_features_array[:self.static_feature_dim]
+                elif len(static_features_array) > self.base_static_feature_dim:
+                    static_features_array = static_features_array[:self.base_static_feature_dim]
 
             except Exception as e:
                 print(f"Warning: Could not load attributes for {gauge_id}: {e}")
                 print("Using random static features.")
-                static_features_array = np.random.randn(self.static_feature_dim)
+                static_features_array = np.random.randn(self.base_static_feature_dim)
 
             # 标准化静态特征
             static_features_array = (static_features_array - np.mean(static_features_array)) / (np.std(static_features_array) + 1e-8)
 
-            # ===== 3. 构建图数据（per-gauge：单节点图）=====
-            # 每个流域是一个单独的节点，没有边
-            x = torch.FloatTensor(static_features_array).unsqueeze(0)  # (1, static_feature_dim)
-            edge_index = torch.tensor([[], []], dtype=torch.long)  # 空边列表
-
-            static_graph_data = Data(x=x, edge_index=edge_index)
+            fallback_static_array = static_features_array
 
             # ===== 4. 创建动态特征（气象输入）=====
             # 注意：在实际应用中，这里应该加载真实的气象数据
@@ -457,6 +476,16 @@ class AdvancedModel:
                     # 截断
                     dynamic_features = dynamic_features.iloc[:, :self.dynamic_feature_dim]
 
+            static_graph_data = self._get_subgraph_for_gauge(gauge_id)
+
+            if static_graph_data is None:
+                x = torch.tensor(fallback_static_array, dtype=torch.float32).unsqueeze(0)
+                augmented_x, target_mask = self._augment_with_target_indicator(x, 0)
+                edge_index = torch.empty((2, 0), dtype=torch.long)
+                static_graph_data = Data(x=augmented_x, edge_index=edge_index)
+                static_graph_data.target_mask = target_mask
+                static_graph_data.target_index = torch.tensor(0, dtype=torch.long)
+
             return dynamic_features, static_graph_data, targets
 
         except Exception as e:
@@ -464,6 +493,202 @@ class AdvancedModel:
             import traceback
             traceback.print_exc()
             return None, None, None
+
+    def _initialize_global_graph(self) -> Optional[int]:
+        """Load HydroATLAS/HydroBASINS graph structure if available."""
+        try:
+            graph_data, gauge_to_node, hybas_to_node = self._build_global_graph_from_hydroatlas()
+        except Exception as e:
+            print(f"Warning: Failed to build global HydroATLAS graph: {e}")
+            import traceback
+            traceback.print_exc()
+            graph_data, gauge_to_node, hybas_to_node = None, {}, {}
+
+        self.global_graph_data = graph_data
+        self.gauge_to_node_idx = gauge_to_node
+        self.hybas_id_to_node_idx = hybas_to_node
+
+        if self.global_graph_data is None:
+            return None
+
+        print(
+            f"Loaded global HydroATLAS graph with "
+            f"{self.global_graph_data.num_nodes} nodes and "
+            f"{self.global_graph_data.num_edges} edges"
+        )
+        return self.global_graph_data.num_node_features
+
+    @staticmethod
+    def _normalize_gauge_id(raw_value) -> Optional[str]:
+        """Normalize gauge identifiers to GRDC-style strings."""
+        if raw_value is None or (isinstance(raw_value, float) and np.isnan(raw_value)):
+            return None
+        gauge_str = str(raw_value).strip()
+        if gauge_str == "" or gauge_str.lower() == "nan":
+            return None
+        if gauge_str.upper().startswith("GRDC_"):
+            return gauge_str.upper()
+        if gauge_str.isdigit():
+            return f"GRDC_{gauge_str}"
+        # Remove potential leading zeros or non-digit prefixes
+        cleaned = gauge_str.replace(' ', '').upper()
+        if cleaned.startswith('GRDC') and not cleaned.startswith('GRDC_'):
+            cleaned = cleaned.replace('GRDC', 'GRDC_', 1)
+        return cleaned
+
+    def _build_global_graph_from_hydroatlas(self):
+        """Build a global graph using HydroATLAS/HydroBASINS metadata."""
+        # Load metadata (may raise if files are missing)
+        hydroatlas_attributes = loading_utils.load_hydroatlas_attributes_file()
+        hybas_info = loading_utils.load_hydroatlas_info_file()
+
+        # Ensure integer HYBAS_ID index alignment
+        hydroatlas_attributes = hydroatlas_attributes.copy()
+        hybas_info = hybas_info.copy()
+
+        hydroatlas_attributes.index = hydroatlas_attributes.index.astype(int)
+        hybas_info.index = hybas_info.index.astype(int)
+
+        common_ids = sorted(set(hydroatlas_attributes.index).intersection(set(hybas_info.index)))
+        if not common_ids:
+            raise ValueError("No overlapping HYBAS_ID between attributes and info files")
+
+        hydroatlas_subset = hydroatlas_attributes.loc[common_ids]
+        hybas_subset = hybas_info.loc[common_ids]
+
+        # Select numeric attributes and normalize
+        numeric_attrs = hydroatlas_subset.select_dtypes(include=[np.number])
+        if numeric_attrs.empty:
+            numeric_attrs = hydroatlas_subset.apply(pd.to_numeric, errors='coerce')
+        numeric_attrs = numeric_attrs.replace([np.inf, -np.inf], np.nan)
+        numeric_attrs = numeric_attrs.fillna(numeric_attrs.mean())
+        numeric_attrs = numeric_attrs.fillna(0.0)
+        numeric_attrs = (numeric_attrs - numeric_attrs.mean()) / (numeric_attrs.std() + 1e-8)
+
+        node_features = torch.tensor(numeric_attrs.values, dtype=torch.float32)
+
+        hybas_id_to_idx = {hybas_id: idx for idx, hybas_id in enumerate(common_ids)}
+
+        # Build directed edges based on downstream relationships
+        downstream_col_candidates = ['NEXT_DOWN', 'NEXTDOWN', 'NEXT_DN', 'NEXTDN']
+        downstream_col = next((c for c in downstream_col_candidates if c in hybas_subset.columns), None)
+
+        if downstream_col is None:
+            print("Warning: HydroATLAS info file missing downstream connectivity column; using isolated nodes.")
+
+        edge_pairs = []
+        edge_weights = []
+
+        weight_col_candidates = ['SUB_AREA', 'SUBAREA', 'UP_AREA', 'UPAREA']
+        weight_col = next((c for c in weight_col_candidates if c in hybas_subset.columns), None)
+
+        for hybas_id, row in hybas_subset.iterrows():
+            if downstream_col is None:
+                break
+            next_down = row.get(downstream_col)
+            if pd.isna(next_down):
+                continue
+            try:
+                next_down = int(next_down)
+            except (TypeError, ValueError):
+                continue
+            if next_down <= 0:
+                continue
+            if next_down not in hybas_id_to_idx:
+                continue
+            src_idx = hybas_id_to_idx[hybas_id]
+            dst_idx = hybas_id_to_idx[next_down]
+            edge_pairs.append((src_idx, dst_idx))
+            edge_pairs.append((dst_idx, src_idx))  # Use undirected edges for message passing
+
+            if weight_col is not None:
+                try:
+                    weight_val = float(row.get(weight_col, 1.0))
+                except (TypeError, ValueError):
+                    weight_val = 1.0
+            else:
+                weight_val = 1.0
+            edge_weights.extend([weight_val, weight_val])
+
+        if edge_pairs:
+            edge_index = torch.tensor(edge_pairs, dtype=torch.long).t().contiguous()
+            edge_weight_tensor = torch.tensor(edge_weights, dtype=torch.float32)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_weight_tensor = None
+
+        graph_data = Data(x=node_features, edge_index=edge_index)
+        if edge_weight_tensor is not None:
+            graph_data.edge_weight = edge_weight_tensor
+        graph_data.hybas_id = torch.tensor(common_ids, dtype=torch.long)
+
+        # Map gauges to node indices
+        gauge_column_candidates = ['GRDC_NO', 'grdc_no', 'GRDC_ID', 'grdc_id', 'gauge_id', 'GAUGE_ID', 'Gauge_ID']
+        gauge_column = next((c for c in gauge_column_candidates if c in hybas_subset.columns), None)
+        gauge_to_node_idx = {}
+        if gauge_column is not None:
+            gauge_series = hybas_subset[gauge_column]
+            for hybas_id, raw_gauge in gauge_series.items():
+                gauge_id = self._normalize_gauge_id(raw_gauge)
+                if gauge_id is None:
+                    continue
+                node_idx = hybas_id_to_idx.get(hybas_id)
+                if node_idx is None:
+                    continue
+                # Preserve first occurrence
+                if gauge_id not in gauge_to_node_idx:
+                    gauge_to_node_idx[gauge_id] = node_idx
+        else:
+            print("Warning: No gauge identifier column found in HydroATLAS info file")
+
+        if gauge_to_node_idx:
+            gauge_mask = torch.zeros(graph_data.num_nodes, dtype=torch.bool)
+            for node_idx in gauge_to_node_idx.values():
+                gauge_mask[node_idx] = True
+            graph_data.gauge_mask = gauge_mask
+
+        return graph_data, gauge_to_node_idx, hybas_id_to_idx
+
+    def _augment_with_target_indicator(self, node_features: torch.Tensor, target_index: int):
+        """Append a binary indicator to node features and build a mask."""
+        indicator = torch.zeros((node_features.size(0), 1), dtype=node_features.dtype)
+        indicator[target_index, 0] = 1.0
+        augmented = torch.cat([node_features, indicator], dim=1)
+        target_mask = torch.zeros(node_features.size(0), dtype=torch.bool)
+        target_mask[target_index] = True
+        return augmented, target_mask
+
+    def _get_subgraph_for_gauge(self, gauge_id: str) -> Optional[Data]:
+        """Extract a subgraph containing the gauge and its upstream/downstream neighbors."""
+        if self.global_graph_data is None:
+            return None
+        node_idx = self.gauge_to_node_idx.get(gauge_id)
+        if node_idx is None:
+            return None
+
+        subset, edge_index, mapping, edge_mask = k_hop_subgraph(
+            node_idx,
+            self.graph_hops,
+            self.global_graph_data.edge_index,
+            relabel_nodes=True,
+            num_nodes=self.global_graph_data.num_nodes
+        )
+
+        sub_x = self.global_graph_data.x[subset]
+        sub_data = Data(x=sub_x, edge_index=edge_index)
+
+        if hasattr(self.global_graph_data, 'edge_weight'):
+            sub_data.edge_weight = self.global_graph_data.edge_weight[edge_mask]
+        if hasattr(self.global_graph_data, 'hybas_id'):
+            sub_data.hybas_id = self.global_graph_data.hybas_id[subset]
+
+        target_local_index = int(mapping.item()) if torch.is_tensor(mapping) else int(mapping)
+        augmented_x, target_mask = self._augment_with_target_indicator(sub_data.x, target_local_index)
+        sub_data.x = augmented_x
+        sub_data.target_mask = target_mask
+        sub_data.target_index = torch.tensor(target_local_index, dtype=torch.long)
+
+        return sub_data
 
 
     def train(self, training_gauge_ids: list[str]):
