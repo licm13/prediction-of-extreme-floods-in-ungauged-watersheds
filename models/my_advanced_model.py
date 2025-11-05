@@ -4,7 +4,7 @@ import xarray as xr
 import numpy as np
 import os
 import sys
-from typing import Optional
+from typing import Dict, Optional, Tuple
 from tqdm import tqdm
 
 # 确保 backend 在路径中，以便可以从 models/ 目录导入
@@ -211,11 +211,70 @@ class HydroDataset(Dataset):
         self.pred_length = pred_length
         self.samples_per_gauge = samples_per_gauge
 
-        # 为每个站点预加载数据（可选，取决于内存）
-        # 这里我们采用懒加载策略
+        # 预缓存每个站点的数据，避免在 __getitem__ 中重复加载
+        self.gauge_cache: dict[str, dict] = {}
+        self.samples: list[tuple[str, int, int]] = []  # (gauge_id, start_idx, end_idx)
+
+        for gauge_id in self.gauge_ids:
+            prepared = self.data_preparation_fn(gauge_id)
+
+            if not prepared or any(item is None for item in prepared):
+                continue
+
+            dynamic_features, static_graph_data, targets = prepared
+
+            if isinstance(dynamic_features, pd.DataFrame):
+                dynamic_df = dynamic_features
+            else:
+                dynamic_df = pd.DataFrame(dynamic_features)
+
+            if isinstance(targets, pd.Series):
+                target_series = targets
+            else:
+                target_series = pd.Series(targets)
+
+            # 对齐并过滤缺失值
+            valid_mask = ~(dynamic_df.isna().any(axis=1) | target_series.isna())
+            dynamic_df = dynamic_df[valid_mask]
+            target_series = target_series[valid_mask]
+
+            if len(target_series) < self.seq_length + self.pred_length:
+                continue
+
+            dynamic_tensor = torch.as_tensor(dynamic_df.values, dtype=torch.float32)
+            target_tensor = torch.as_tensor(target_series.values, dtype=torch.float32)
+
+            # 对动态特征按特征维度进行归一化（标准化）
+            feature_mean = dynamic_tensor.mean(dim=0, keepdim=True)
+            feature_std = dynamic_tensor.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+            dynamic_tensor = (dynamic_tensor - feature_mean) / feature_std
+
+            if not isinstance(static_graph_data, Data):
+                raise TypeError("Expected static_graph_data to be a torch_geometric.data.Data instance")
+
+            total_length = target_tensor.shape[0]
+            max_start = total_length - (self.seq_length + self.pred_length)
+
+            if max_start < 0:
+                continue
+
+            windows = [(start, start + self.seq_length) for start in range(max_start + 1)]
+
+            if not windows:
+                continue
+
+            self.gauge_cache[gauge_id] = {
+                "dynamic": dynamic_tensor,
+                "targets": target_tensor,
+                "graph": static_graph_data,
+                "windows": windows,
+            }
+
+            for start_idx, end_idx in windows:
+                self.samples.append((gauge_id, start_idx, end_idx))
 
     def __len__(self):
-        return len(self.gauge_ids) * self.samples_per_gauge
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
@@ -224,54 +283,22 @@ class HydroDataset(Dataset):
         Returns:
             (rnn_input, gnn_graph_data, target)
         """
-        # 确定是哪个站点
-        gauge_idx = idx // self.samples_per_gauge
-        gauge_id = self.gauge_ids[gauge_idx]
+        gauge_id, start_idx, end_idx = self.samples[idx]
 
-        # 加载该站点的完整数据
-        dynamic_features, static_features, targets = self.data_preparation_fn(gauge_id)
-
-        if dynamic_features is None or static_features is None or targets is None:
-            # 返回空样本（在 collate_fn 中过滤）
+        cache = self.gauge_cache.get(gauge_id)
+        if cache is None:
             return None
 
-        # 清理 NaN
-        valid_mask = ~(dynamic_features.isna().any(axis=1) | targets.isna())
-        dynamic_features = dynamic_features[valid_mask]
-        targets = targets[valid_mask]
+        dynamic_tensor = cache["dynamic"][start_idx:end_idx]
+        target_tensor = cache["targets"][end_idx:end_idx + self.pred_length]
 
-        if len(targets) < self.seq_length + self.pred_length:
-            # 数据不足
+        # 复制静态图，避免在批处理中出现共享引用问题
+        gnn_graph_data = cache["graph"].clone() if hasattr(cache["graph"], "clone") else cache["graph"]
+
+        if dynamic_tensor.shape[0] != self.seq_length or target_tensor.shape[0] != self.pred_length:
             return None
 
-        # 随机采样一个时间窗口
-        max_start_idx = len(targets) - self.seq_length - self.pred_length
-        if max_start_idx <= 0:
-            return None
-
-        start_idx = np.random.randint(0, max_start_idx)
-        end_idx = start_idx + self.seq_length
-
-        # 提取 RNN 输入序列
-        rnn_input = dynamic_features.iloc[start_idx:end_idx].values  # (seq_length, num_features)
-        rnn_input = torch.FloatTensor(rnn_input)
-
-        # 提取目标（预测窗口）
-        # 注意：targets 可能是 Series，需要确保对齐
-        target_values = targets.iloc[end_idx:end_idx + self.pred_length].values
-
-        # 如果 pred_length 不足，填充
-        if len(target_values) < self.pred_length:
-            padding = np.full(self.pred_length - len(target_values), np.nan)
-            target_values = np.concatenate([target_values, padding])
-
-        target = torch.FloatTensor(target_values)
-
-        # GNN 输入（静态图数据）
-        # static_features 是 PyG Data 对象
-        gnn_graph_data = static_features
-
-        return rnn_input, gnn_graph_data, target
+        return dynamic_tensor, gnn_graph_data, target_tensor
 
 
 def collate_fn(batch):
@@ -284,19 +311,23 @@ def collate_fn(batch):
     if len(batch) == 0:
         return None, None, None
 
-    # 分离组件
-    rnn_inputs = [item[0] for item in batch]
-    gnn_graphs = [item[1] for item in batch]
-    targets = [item[2] for item in batch]
+    expected_seq_len = batch[0][0].shape[0]
+    expected_target_len = batch[0][2].shape[0]
 
-    # 批处理 RNN 输入
-    rnn_batch = torch.stack(rnn_inputs)  # (batch_size, seq_length, num_features)
+    filtered_batch = []
+    for rnn_input, gnn_graph, target in batch:
+        if rnn_input.shape[0] != expected_seq_len or target.shape[0] != expected_target_len:
+            continue
+        filtered_batch.append((rnn_input, gnn_graph, target))
 
-    # 批处理 GNN 图数据
-    gnn_batch = Batch.from_data_list(gnn_graphs)
+    if len(filtered_batch) == 0:
+        return None, None, None
 
-    # 批处理目标
-    target_batch = torch.stack(targets)  # (batch_size, pred_length)
+    rnn_inputs, gnn_graphs, targets = zip(*filtered_batch)
+
+    rnn_batch = torch.stack(list(rnn_inputs))  # (batch_size, seq_length, num_features)
+    gnn_batch = Batch.from_data_list(list(gnn_graphs))
+    target_batch = torch.stack(list(targets))  # (batch_size, pred_length)
 
     return rnn_batch, gnn_batch, target_batch
 
@@ -334,20 +365,7 @@ class AdvancedModel:
         self.num_epochs = model_params.get('num_epochs', 50)
         self.seq_length = model_params.get('seq_length', 365)
         self.samples_per_gauge = model_params.get('samples_per_gauge', 10)
-        self.graph_hops = model_params.get('graph_hops', 2)
-
-        # 初始化图结构
-        self.global_graph_data = None
-        self.gauge_to_node_idx = {}
-        self.hybas_id_to_node_idx = {}
-        self.base_static_feature_dim = self.config_static_feature_dim
-
-        global_feature_dim = self._initialize_global_graph()
-        if global_feature_dim is not None:
-            self.base_static_feature_dim = global_feature_dim
-
-        # 节点特征额外包含目标指示器
-        self.static_feature_dim = self.base_static_feature_dim + 1
+        self.meteorology_file = model_params.get('meteorology_file', None)
 
         # 设置设备（GPU 或 CPU）
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -380,9 +398,205 @@ class AdvancedModel:
         loading_utils.create_remote_folder_if_necessary(self.output_path)
         loading_utils.create_remote_folder_if_necessary(self.checkpoint_path)
 
+        # 缓存核心数据以避免重复读盘
+        self._grdc_data: Optional[xr.Dataset] = None
+        self._available_gauges: set[str] = set()
+        self._static_attributes_df: Optional[pd.DataFrame] = None
+        self._static_attribute_order: Optional[list[str]] = None
+        self._static_attr_mean: Optional[pd.Series] = None
+        self._static_attr_std: Optional[pd.Series] = None
+        self._dynamic_feature_columns: Optional[list[str]] = None
+        self._meteorology_data: Optional[xr.Dataset] = None
+        self._meteorology_load_failed = False
+        self._gauge_cache: Dict[str, Tuple[pd.DataFrame, Data, pd.Series]] = {}
+
+        self._initialize_data_caches()
+
         print(f"Initializing AdvancedModel for experiment: {self.experiment_name}")
         print(f"Model outputs will be saved to: {self.output_path}")
         print(f"Model architecture: {self.model}")
+
+    def _initialize_data_caches(self) -> None:
+        """Load core datasets once and prepare shared statistics."""
+
+        self._grdc_data = loading_utils.load_grdc_data()
+        if self._grdc_data is not None and 'gauge_id' in self._grdc_data.coords:
+            self._available_gauges = set(self._grdc_data.gauge_id.values.tolist())
+        else:
+            self._available_gauges = set()
+
+        try:
+            attributes_df = loading_utils.load_attributes_file()
+            self._static_attributes_df = attributes_df.sort_index()
+            self._static_attribute_order = list(self._static_attributes_df.columns)
+            self._static_attr_mean = self._static_attributes_df.mean().astype(float).fillna(0.0)
+            self._static_attr_std = (
+                self._static_attributes_df.std(ddof=0).astype(float).replace(0, np.nan).fillna(1.0)
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Warning: Failed to load static attributes: {exc}")
+            self._static_attributes_df = None
+            self._static_attribute_order = None
+            self._static_attr_mean = None
+            self._static_attr_std = None
+
+        self._get_meteorology_dataset()
+        self._gauge_cache.clear()
+
+    def _get_meteorology_dataset(self) -> Optional[xr.Dataset]:
+        """Return cached meteorology dataset, loading if necessary."""
+
+        if self._meteorology_data is None and not self._meteorology_load_failed:
+            try:
+                self._meteorology_data = loading_utils.load_meteorology(self.meteorology_file)
+            except ValueError as exc:
+                print(f"Error validating meteorology dataset: {exc}")
+                self._meteorology_data = None
+                self._meteorology_load_failed = True
+
+            if self._meteorology_data is None:
+                self._meteorology_load_failed = True
+
+        return self._meteorology_data
+
+    def invalidate_cache(self, reload_data: bool = False) -> None:
+        """Invalidate per-gauge caches, optionally reloading backing data."""
+
+        self._gauge_cache.clear()
+        if reload_data:
+            self._meteorology_data = None
+            self._meteorology_load_failed = False
+            self._initialize_data_caches()
+
+    def _prepare_static_graph(self, gauge_id: str) -> Data:
+        """Create a PyG Data object with scaled static attributes for a gauge."""
+
+        if (
+            self._static_attributes_df is None
+            or self._static_attribute_order is None
+            or gauge_id not in self._static_attributes_df.index
+        ):
+            static_array = np.zeros(self.static_feature_dim, dtype=np.float32)
+        else:
+            attrs = self._static_attributes_df.loc[gauge_id]
+            attrs = attrs.reindex(self._static_attribute_order)
+            attrs = attrs.astype(float)
+
+            if self._static_attr_mean is not None:
+                attrs = attrs.fillna(self._static_attr_mean.reindex(self._static_attribute_order))
+            attrs = attrs.fillna(0.0)
+
+            mean_values = (
+                self._static_attr_mean.reindex(self._static_attribute_order).fillna(0.0).values
+                if self._static_attr_mean is not None
+                else np.zeros(len(attrs))
+            )
+            std_values = (
+                self._static_attr_std.reindex(self._static_attribute_order).fillna(1.0).values
+                if self._static_attr_std is not None
+                else np.ones(len(attrs))
+            )
+
+            static_array = (attrs.values - mean_values) / (std_values + 1e-8)
+            static_array = np.nan_to_num(static_array, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if len(static_array) < self.static_feature_dim:
+                padding = np.zeros(self.static_feature_dim - len(static_array), dtype=np.float32)
+                static_array = np.concatenate([static_array, padding])
+            elif len(static_array) > self.static_feature_dim:
+                static_array = static_array[:self.static_feature_dim]
+
+        static_tensor = torch.as_tensor(static_array, dtype=torch.float32).unsqueeze(0)
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        return Data(x=static_tensor, edge_index=edge_index)
+
+    def _extract_dynamic_features(
+        self,
+        gauge_id: str,
+        target_index: pd.DatetimeIndex,
+    ) -> Optional[pd.DataFrame]:
+        """Extract meteorology aligned to gauge and time index."""
+
+        meteorology = self._get_meteorology_dataset()
+        if meteorology is None or 'gauge_id' not in meteorology.coords:
+            return None
+
+        if gauge_id not in meteorology.gauge_id.values:
+            print(f"Warning: {gauge_id} not present in meteorology data")
+            return None
+
+        gauge_met = meteorology.sel(gauge_id=gauge_id)
+
+        target_mask = xr.DataArray(
+            np.ones(len(target_index), dtype=np.int8),
+            coords={'time': target_index},
+            dims=['time']
+        )
+
+        gauge_met, _ = xr.align(gauge_met, target_mask, join='inner')
+
+        if 'time' not in gauge_met.coords or gauge_met.sizes.get('time', 0) == 0:
+            return None
+
+        met_df = gauge_met.to_dataframe().reset_index()
+        if 'gauge_id' in met_df.columns:
+            met_df = met_df.drop(columns=['gauge_id'])
+        met_df = met_df.set_index('time').sort_index()
+
+        return met_df
+
+    def _format_dynamic_features(
+        self,
+        features: Optional[pd.DataFrame],
+        index: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """Ensure dynamic features are numeric, aligned, and have expected width."""
+
+        if features is None:
+            features = pd.DataFrame(index=index)
+        else:
+            features = features.reindex(index)
+
+        features = features.apply(pd.to_numeric, errors='coerce')
+        features = features.replace([np.inf, -np.inf], np.nan)
+        features = features.sort_index()
+        features = features.reindex(index)
+
+        if len(features) > 0:
+            try:
+                features = features.interpolate(method='time', limit_direction='both')
+            except Exception:
+                features = features.interpolate(limit_direction='both')
+            features = features.fillna(method='ffill').fillna(method='bfill')
+
+        features = features.fillna(0.0)
+
+        if features.shape[1] == 0:
+            columns = [f'feature_{i}' for i in range(self.dynamic_feature_dim)]
+            features = pd.DataFrame(0.0, index=index, columns=columns, dtype=np.float32)
+            self._dynamic_feature_columns = columns
+            return features
+
+        if self._dynamic_feature_columns is None:
+            existing_cols = list(features.columns)
+            extra_idx = 0
+            while len(existing_cols) < self.dynamic_feature_dim:
+                candidate = f'extra_{extra_idx}'
+                extra_idx += 1
+                if candidate in existing_cols:
+                    continue
+                features[candidate] = 0.0
+                existing_cols.append(candidate)
+
+            if len(existing_cols) > self.dynamic_feature_dim:
+                existing_cols = existing_cols[:self.dynamic_feature_dim]
+                features = features[existing_cols]
+
+            self._dynamic_feature_columns = existing_cols[:self.dynamic_feature_dim]
+        else:
+            features = features.reindex(columns=self._dynamic_feature_columns, fill_value=0.0)
+
+        return features.astype(np.float32)
 
     def _prepare_data_for_gauge(self, gauge_id: str) -> tuple:
         """
@@ -397,84 +611,61 @@ class AdvancedModel:
                 - static_graph_data: PyG Data 对象 - 静态流域属性图
                 - targets: pd.Series (time,) - 观测径流
         """
-        try:
-            # ===== 1. 加载观测数据 (目标) =====
-            ds_grdc = loading_utils.load_grdc_data()
-
-            # 检查站点是否存在
-            if gauge_id not in ds_grdc.gauge_id.values:
-                print(f"Gauge {gauge_id} not found in GRDC data.")
-                return None, None, None
-
-            ds_grdc_gauge = ds_grdc.sel(gauge_id=gauge_id)
-
-            # 提取观测径流（选择第一个前导时间作为目标，因为这是"同步"观测）
-            targets = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0).to_pandas()
-
-            # 清理无效值
-            targets = targets.replace([np.inf, -np.inf], np.nan)
-
-            # ===== 2. 加载静态流域属性 (用于 GNN) =====
-            try:
-                static_attrs_df = loading_utils.load_attributes_file(gauges=[gauge_id])
-
-                # 处理缺失值
-                static_attrs_df = static_attrs_df.fillna(static_attrs_df.mean())
-                static_attrs_df = static_attrs_df.fillna(0)  # 如果所有值都是 NaN
-
-                # 转换为 numpy 数组
-                static_features_array = static_attrs_df.values[0]  # (num_static_features,)
-
-                # 确保特征数量与模型匹配（不含目标指示器）
-                if len(static_features_array) < self.base_static_feature_dim:
-                    padding = np.zeros(self.base_static_feature_dim - len(static_features_array))
-                    static_features_array = np.concatenate([static_features_array, padding])
-                elif len(static_features_array) > self.base_static_feature_dim:
-                    static_features_array = static_features_array[:self.base_static_feature_dim]
-
-            except Exception as e:
-                print(f"Warning: Could not load attributes for {gauge_id}: {e}")
-                print("Using random static features.")
-                static_features_array = np.random.randn(self.base_static_feature_dim)
-
-            # 标准化静态特征
-            static_features_array = (static_features_array - np.mean(static_features_array)) / (np.std(static_features_array) + 1e-8)
-
-            fallback_static_array = static_features_array
-
-            # ===== 4. 创建动态特征（气象输入）=====
-            # 注意：在实际应用中，这里应该加载真实的气象数据
-            # 由于示例中没有提供气象数据加载函数，我们创建模拟数据
-
-            # 创建与 targets 时间索引对齐的模拟气象数据
-            time_index = targets.index
-
-            # 模拟 5 个气象特征：降水、温度、潜在蒸散发、土壤湿度、积雪
-            np.random.seed(hash(gauge_id) % (2**32))  # 为每个站点设置可重复的随机种子
-
-            dynamic_features = pd.DataFrame(
-                {
-                    'precip': np.abs(np.random.randn(len(time_index)) * 5 + 2),  # 降水（非负）
-                    'temp': np.random.randn(len(time_index)) * 10 + 15,  # 温度
-                    'pet': np.abs(np.random.randn(len(time_index)) * 2 + 3),  # 潜在蒸散发
-                    'soil_moisture': np.random.rand(len(time_index)) * 0.5 + 0.2,  # 土壤湿度 [0.2, 0.7]
-                    'snow': np.abs(np.random.randn(len(time_index)) * 3),  # 积雪
-                },
-                index=time_index
+        if gauge_id in self._gauge_cache:
+            cached_dynamic, cached_static, cached_targets = self._gauge_cache[gauge_id]
+            return (
+                cached_dynamic.copy(deep=True),
+                cached_static.clone(),
+                cached_targets.copy(deep=True),
             )
 
-            # 确保特征数量与模型匹配
-            if dynamic_features.shape[1] != self.dynamic_feature_dim:
-                print(f"Warning: Dynamic features have {dynamic_features.shape[1]} columns, "
-                      f"but model expects {self.dynamic_feature_dim}. Adjusting...")
+        if not self._available_gauges:
+            self._initialize_data_caches()
 
-                if dynamic_features.shape[1] < self.dynamic_feature_dim:
-                    # 添加额外的随机特征
-                    for i in range(self.dynamic_feature_dim - dynamic_features.shape[1]):
-                        dynamic_features[f'extra_{i}'] = np.random.randn(len(time_index))
-                else:
-                    # 截断
-                    dynamic_features = dynamic_features.iloc[:, :self.dynamic_feature_dim]
+        if gauge_id not in self._available_gauges:
+            print(f"Gauge {gauge_id} not found in GRDC data.")
+            return None, None, None
+
+        try:
+            ds_grdc_gauge = self._grdc_data.sel(gauge_id=gauge_id)
+            targets_da = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0)
+            targets = targets_da.to_pandas()
+
+            if isinstance(targets, pd.DataFrame):
+                targets = targets.iloc[:, 0]
+
+            targets = targets.replace([np.inf, -np.inf], np.nan).dropna()
+            targets = targets.sort_index()
+
+            if targets.empty:
+                print(f"Warning: No valid observations for {gauge_id}")
+                return None, None, None
+
+            dynamic_features = self._extract_dynamic_features(gauge_id, targets.index)
+
+            if dynamic_features is not None and not dynamic_features.empty:
+                common_index = targets.index.intersection(dynamic_features.index)
+                targets = targets.loc[common_index]
+                dynamic_features = dynamic_features.loc[common_index]
+            else:
+                common_index = targets.index
+
+            if len(common_index) == 0:
+                print(f"Warning: No overlapping meteorology for {gauge_id}")
+                return None, None, None
+
+            targets = targets.loc[common_index]
+            dynamic_features = self._format_dynamic_features(dynamic_features, targets.index)
+            targets = targets.astype(np.float32)
+
+            static_graph_data = self._prepare_static_graph(gauge_id)
+
+            cache_entry = (
+                dynamic_features.copy(deep=True),
+                static_graph_data.clone(),
+                targets.copy(deep=True),
+            )
+            self._gauge_cache[gauge_id] = cache_entry
 
             static_graph_data = self._get_subgraph_for_gauge(gauge_id)
 
@@ -488,208 +679,11 @@ class AdvancedModel:
 
             return dynamic_features, static_graph_data, targets
 
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             print(f"Error loading data for gauge {gauge_id}: {e}")
             import traceback
             traceback.print_exc()
             return None, None, None
-
-    def _initialize_global_graph(self) -> Optional[int]:
-        """Load HydroATLAS/HydroBASINS graph structure if available."""
-        try:
-            graph_data, gauge_to_node, hybas_to_node = self._build_global_graph_from_hydroatlas()
-        except Exception as e:
-            print(f"Warning: Failed to build global HydroATLAS graph: {e}")
-            import traceback
-            traceback.print_exc()
-            graph_data, gauge_to_node, hybas_to_node = None, {}, {}
-
-        self.global_graph_data = graph_data
-        self.gauge_to_node_idx = gauge_to_node
-        self.hybas_id_to_node_idx = hybas_to_node
-
-        if self.global_graph_data is None:
-            return None
-
-        print(
-            f"Loaded global HydroATLAS graph with "
-            f"{self.global_graph_data.num_nodes} nodes and "
-            f"{self.global_graph_data.num_edges} edges"
-        )
-        return self.global_graph_data.num_node_features
-
-    @staticmethod
-    def _normalize_gauge_id(raw_value) -> Optional[str]:
-        """Normalize gauge identifiers to GRDC-style strings."""
-        if raw_value is None or (isinstance(raw_value, float) and np.isnan(raw_value)):
-            return None
-        gauge_str = str(raw_value).strip()
-        if gauge_str == "" or gauge_str.lower() == "nan":
-            return None
-        if gauge_str.upper().startswith("GRDC_"):
-            return gauge_str.upper()
-        if gauge_str.isdigit():
-            return f"GRDC_{gauge_str}"
-        # Remove potential leading zeros or non-digit prefixes
-        cleaned = gauge_str.replace(' ', '').upper()
-        if cleaned.startswith('GRDC') and not cleaned.startswith('GRDC_'):
-            cleaned = cleaned.replace('GRDC', 'GRDC_', 1)
-        return cleaned
-
-    def _build_global_graph_from_hydroatlas(self):
-        """Build a global graph using HydroATLAS/HydroBASINS metadata."""
-        # Load metadata (may raise if files are missing)
-        hydroatlas_attributes = loading_utils.load_hydroatlas_attributes_file()
-        hybas_info = loading_utils.load_hydroatlas_info_file()
-
-        # Ensure integer HYBAS_ID index alignment
-        hydroatlas_attributes = hydroatlas_attributes.copy()
-        hybas_info = hybas_info.copy()
-
-        hydroatlas_attributes.index = hydroatlas_attributes.index.astype(int)
-        hybas_info.index = hybas_info.index.astype(int)
-
-        common_ids = sorted(set(hydroatlas_attributes.index).intersection(set(hybas_info.index)))
-        if not common_ids:
-            raise ValueError("No overlapping HYBAS_ID between attributes and info files")
-
-        hydroatlas_subset = hydroatlas_attributes.loc[common_ids]
-        hybas_subset = hybas_info.loc[common_ids]
-
-        # Select numeric attributes and normalize
-        numeric_attrs = hydroatlas_subset.select_dtypes(include=[np.number])
-        if numeric_attrs.empty:
-            numeric_attrs = hydroatlas_subset.apply(pd.to_numeric, errors='coerce')
-        numeric_attrs = numeric_attrs.replace([np.inf, -np.inf], np.nan)
-        numeric_attrs = numeric_attrs.fillna(numeric_attrs.mean())
-        numeric_attrs = numeric_attrs.fillna(0.0)
-        numeric_attrs = (numeric_attrs - numeric_attrs.mean()) / (numeric_attrs.std() + 1e-8)
-
-        node_features = torch.tensor(numeric_attrs.values, dtype=torch.float32)
-
-        hybas_id_to_idx = {hybas_id: idx for idx, hybas_id in enumerate(common_ids)}
-
-        # Build directed edges based on downstream relationships
-        downstream_col_candidates = ['NEXT_DOWN', 'NEXTDOWN', 'NEXT_DN', 'NEXTDN']
-        downstream_col = next((c for c in downstream_col_candidates if c in hybas_subset.columns), None)
-
-        if downstream_col is None:
-            print("Warning: HydroATLAS info file missing downstream connectivity column; using isolated nodes.")
-
-        edge_pairs = []
-        edge_weights = []
-
-        weight_col_candidates = ['SUB_AREA', 'SUBAREA', 'UP_AREA', 'UPAREA']
-        weight_col = next((c for c in weight_col_candidates if c in hybas_subset.columns), None)
-
-        for hybas_id, row in hybas_subset.iterrows():
-            if downstream_col is None:
-                break
-            next_down = row.get(downstream_col)
-            if pd.isna(next_down):
-                continue
-            try:
-                next_down = int(next_down)
-            except (TypeError, ValueError):
-                continue
-            if next_down <= 0:
-                continue
-            if next_down not in hybas_id_to_idx:
-                continue
-            src_idx = hybas_id_to_idx[hybas_id]
-            dst_idx = hybas_id_to_idx[next_down]
-            edge_pairs.append((src_idx, dst_idx))
-            edge_pairs.append((dst_idx, src_idx))  # Use undirected edges for message passing
-
-            if weight_col is not None:
-                try:
-                    weight_val = float(row.get(weight_col, 1.0))
-                except (TypeError, ValueError):
-                    weight_val = 1.0
-            else:
-                weight_val = 1.0
-            edge_weights.extend([weight_val, weight_val])
-
-        if edge_pairs:
-            edge_index = torch.tensor(edge_pairs, dtype=torch.long).t().contiguous()
-            edge_weight_tensor = torch.tensor(edge_weights, dtype=torch.float32)
-        else:
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weight_tensor = None
-
-        graph_data = Data(x=node_features, edge_index=edge_index)
-        if edge_weight_tensor is not None:
-            graph_data.edge_weight = edge_weight_tensor
-        graph_data.hybas_id = torch.tensor(common_ids, dtype=torch.long)
-
-        # Map gauges to node indices
-        gauge_column_candidates = ['GRDC_NO', 'grdc_no', 'GRDC_ID', 'grdc_id', 'gauge_id', 'GAUGE_ID', 'Gauge_ID']
-        gauge_column = next((c for c in gauge_column_candidates if c in hybas_subset.columns), None)
-        gauge_to_node_idx = {}
-        if gauge_column is not None:
-            gauge_series = hybas_subset[gauge_column]
-            for hybas_id, raw_gauge in gauge_series.items():
-                gauge_id = self._normalize_gauge_id(raw_gauge)
-                if gauge_id is None:
-                    continue
-                node_idx = hybas_id_to_idx.get(hybas_id)
-                if node_idx is None:
-                    continue
-                # Preserve first occurrence
-                if gauge_id not in gauge_to_node_idx:
-                    gauge_to_node_idx[gauge_id] = node_idx
-        else:
-            print("Warning: No gauge identifier column found in HydroATLAS info file")
-
-        if gauge_to_node_idx:
-            gauge_mask = torch.zeros(graph_data.num_nodes, dtype=torch.bool)
-            for node_idx in gauge_to_node_idx.values():
-                gauge_mask[node_idx] = True
-            graph_data.gauge_mask = gauge_mask
-
-        return graph_data, gauge_to_node_idx, hybas_id_to_idx
-
-    def _augment_with_target_indicator(self, node_features: torch.Tensor, target_index: int):
-        """Append a binary indicator to node features and build a mask."""
-        indicator = torch.zeros((node_features.size(0), 1), dtype=node_features.dtype)
-        indicator[target_index, 0] = 1.0
-        augmented = torch.cat([node_features, indicator], dim=1)
-        target_mask = torch.zeros(node_features.size(0), dtype=torch.bool)
-        target_mask[target_index] = True
-        return augmented, target_mask
-
-    def _get_subgraph_for_gauge(self, gauge_id: str) -> Optional[Data]:
-        """Extract a subgraph containing the gauge and its upstream/downstream neighbors."""
-        if self.global_graph_data is None:
-            return None
-        node_idx = self.gauge_to_node_idx.get(gauge_id)
-        if node_idx is None:
-            return None
-
-        subset, edge_index, mapping, edge_mask = k_hop_subgraph(
-            node_idx,
-            self.graph_hops,
-            self.global_graph_data.edge_index,
-            relabel_nodes=True,
-            num_nodes=self.global_graph_data.num_nodes
-        )
-
-        sub_x = self.global_graph_data.x[subset]
-        sub_data = Data(x=sub_x, edge_index=edge_index)
-
-        if hasattr(self.global_graph_data, 'edge_weight'):
-            sub_data.edge_weight = self.global_graph_data.edge_weight[edge_mask]
-        if hasattr(self.global_graph_data, 'hybas_id'):
-            sub_data.hybas_id = self.global_graph_data.hybas_id[subset]
-
-        target_local_index = int(mapping.item()) if torch.is_tensor(mapping) else int(mapping)
-        augmented_x, target_mask = self._augment_with_target_indicator(sub_data.x, target_local_index)
-        sub_data.x = augmented_x
-        sub_data.target_mask = target_mask
-        sub_data.target_index = torch.tensor(target_local_index, dtype=torch.long)
-
-        return sub_data
-
 
     def train(self, training_gauge_ids: list[str]):
         """
