@@ -199,11 +199,70 @@ class HydroDataset(Dataset):
         self.pred_length = pred_length
         self.samples_per_gauge = samples_per_gauge
 
-        # 为每个站点预加载数据（可选，取决于内存）
-        # 这里我们采用懒加载策略
+        # 预缓存每个站点的数据，避免在 __getitem__ 中重复加载
+        self.gauge_cache: dict[str, dict] = {}
+        self.samples: list[tuple[str, int, int]] = []  # (gauge_id, start_idx, end_idx)
+
+        for gauge_id in self.gauge_ids:
+            prepared = self.data_preparation_fn(gauge_id)
+
+            if not prepared or any(item is None for item in prepared):
+                continue
+
+            dynamic_features, static_graph_data, targets = prepared
+
+            if isinstance(dynamic_features, pd.DataFrame):
+                dynamic_df = dynamic_features
+            else:
+                dynamic_df = pd.DataFrame(dynamic_features)
+
+            if isinstance(targets, pd.Series):
+                target_series = targets
+            else:
+                target_series = pd.Series(targets)
+
+            # 对齐并过滤缺失值
+            valid_mask = ~(dynamic_df.isna().any(axis=1) | target_series.isna())
+            dynamic_df = dynamic_df[valid_mask]
+            target_series = target_series[valid_mask]
+
+            if len(target_series) < self.seq_length + self.pred_length:
+                continue
+
+            dynamic_tensor = torch.as_tensor(dynamic_df.values, dtype=torch.float32)
+            target_tensor = torch.as_tensor(target_series.values, dtype=torch.float32)
+
+            # 对动态特征按特征维度进行归一化（标准化）
+            feature_mean = dynamic_tensor.mean(dim=0, keepdim=True)
+            feature_std = dynamic_tensor.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+            dynamic_tensor = (dynamic_tensor - feature_mean) / feature_std
+
+            if not isinstance(static_graph_data, Data):
+                raise TypeError("Expected static_graph_data to be a torch_geometric.data.Data instance")
+
+            total_length = target_tensor.shape[0]
+            max_start = total_length - (self.seq_length + self.pred_length)
+
+            if max_start < 0:
+                continue
+
+            windows = [(start, start + self.seq_length) for start in range(max_start + 1)]
+
+            if not windows:
+                continue
+
+            self.gauge_cache[gauge_id] = {
+                "dynamic": dynamic_tensor,
+                "targets": target_tensor,
+                "graph": static_graph_data,
+                "windows": windows,
+            }
+
+            for start_idx, end_idx in windows:
+                self.samples.append((gauge_id, start_idx, end_idx))
 
     def __len__(self):
-        return len(self.gauge_ids) * self.samples_per_gauge
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
@@ -212,54 +271,22 @@ class HydroDataset(Dataset):
         Returns:
             (rnn_input, gnn_graph_data, target)
         """
-        # 确定是哪个站点
-        gauge_idx = idx // self.samples_per_gauge
-        gauge_id = self.gauge_ids[gauge_idx]
+        gauge_id, start_idx, end_idx = self.samples[idx]
 
-        # 加载该站点的完整数据
-        dynamic_features, static_features, targets = self.data_preparation_fn(gauge_id)
-
-        if dynamic_features is None or static_features is None or targets is None:
-            # 返回空样本（在 collate_fn 中过滤）
+        cache = self.gauge_cache.get(gauge_id)
+        if cache is None:
             return None
 
-        # 清理 NaN
-        valid_mask = ~(dynamic_features.isna().any(axis=1) | targets.isna())
-        dynamic_features = dynamic_features[valid_mask]
-        targets = targets[valid_mask]
+        dynamic_tensor = cache["dynamic"][start_idx:end_idx]
+        target_tensor = cache["targets"][end_idx:end_idx + self.pred_length]
 
-        if len(targets) < self.seq_length + self.pred_length:
-            # 数据不足
+        # 复制静态图，避免在批处理中出现共享引用问题
+        gnn_graph_data = cache["graph"].clone() if hasattr(cache["graph"], "clone") else cache["graph"]
+
+        if dynamic_tensor.shape[0] != self.seq_length or target_tensor.shape[0] != self.pred_length:
             return None
 
-        # 随机采样一个时间窗口
-        max_start_idx = len(targets) - self.seq_length - self.pred_length
-        if max_start_idx <= 0:
-            return None
-
-        start_idx = np.random.randint(0, max_start_idx)
-        end_idx = start_idx + self.seq_length
-
-        # 提取 RNN 输入序列
-        rnn_input = dynamic_features.iloc[start_idx:end_idx].values  # (seq_length, num_features)
-        rnn_input = torch.FloatTensor(rnn_input)
-
-        # 提取目标（预测窗口）
-        # 注意：targets 可能是 Series，需要确保对齐
-        target_values = targets.iloc[end_idx:end_idx + self.pred_length].values
-
-        # 如果 pred_length 不足，填充
-        if len(target_values) < self.pred_length:
-            padding = np.full(self.pred_length - len(target_values), np.nan)
-            target_values = np.concatenate([target_values, padding])
-
-        target = torch.FloatTensor(target_values)
-
-        # GNN 输入（静态图数据）
-        # static_features 是 PyG Data 对象
-        gnn_graph_data = static_features
-
-        return rnn_input, gnn_graph_data, target
+        return dynamic_tensor, gnn_graph_data, target_tensor
 
 
 def collate_fn(batch):
@@ -272,19 +299,23 @@ def collate_fn(batch):
     if len(batch) == 0:
         return None, None, None
 
-    # 分离组件
-    rnn_inputs = [item[0] for item in batch]
-    gnn_graphs = [item[1] for item in batch]
-    targets = [item[2] for item in batch]
+    expected_seq_len = batch[0][0].shape[0]
+    expected_target_len = batch[0][2].shape[0]
 
-    # 批处理 RNN 输入
-    rnn_batch = torch.stack(rnn_inputs)  # (batch_size, seq_length, num_features)
+    filtered_batch = []
+    for rnn_input, gnn_graph, target in batch:
+        if rnn_input.shape[0] != expected_seq_len or target.shape[0] != expected_target_len:
+            continue
+        filtered_batch.append((rnn_input, gnn_graph, target))
 
-    # 批处理 GNN 图数据
-    gnn_batch = Batch.from_data_list(gnn_graphs)
+    if len(filtered_batch) == 0:
+        return None, None, None
 
-    # 批处理目标
-    target_batch = torch.stack(targets)  # (batch_size, pred_length)
+    rnn_inputs, gnn_graphs, targets = zip(*filtered_batch)
+
+    rnn_batch = torch.stack(list(rnn_inputs))  # (batch_size, seq_length, num_features)
+    gnn_batch = Batch.from_data_list(list(gnn_graphs))
+    target_batch = torch.stack(list(targets))  # (batch_size, pred_length)
 
     return rnn_batch, gnn_batch, target_batch
 
