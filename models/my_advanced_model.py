@@ -352,7 +352,7 @@ class AdvancedModel:
         self.experiment_name = experiment_name
 
         # 提取超参数（带默认值）
-        self.config_static_feature_dim = model_params.get('static_feature_dim', 50)
+        self.static_feature_dim = model_params.get('static_feature_dim', 50)
         self.dynamic_feature_dim = model_params.get('dynamic_feature_dim', 5)
         self.gnn_hidden_dim = model_params.get('gnn_hidden_dim', 64)
         self.rnn_hidden_dim = model_params.get('rnn_hidden_dim', 128)
@@ -478,26 +478,26 @@ class AdvancedModel:
         ):
             static_array = np.zeros(self.static_feature_dim, dtype=np.float32)
         else:
-            attrs = self._static_attributes_df.loc[gauge_id]
-            attrs = attrs.reindex(self._static_attribute_order)
-            attrs = attrs.astype(float)
+            gauge_attrs = self._static_attributes_df.loc[gauge_id]
+            gauge_attrs = gauge_attrs.reindex(self._static_attribute_order)
+            gauge_attrs = gauge_attrs.astype(float)
 
             if self._static_attr_mean is not None:
-                attrs = attrs.fillna(self._static_attr_mean.reindex(self._static_attribute_order))
-            attrs = attrs.fillna(0.0)
+                gauge_attrs = gauge_attrs.fillna(self._static_attr_mean.reindex(self._static_attribute_order))
+            gauge_attrs = gauge_attrs.fillna(0.0)
 
             mean_values = (
                 self._static_attr_mean.reindex(self._static_attribute_order).fillna(0.0).values
                 if self._static_attr_mean is not None
-                else np.zeros(len(attrs))
+                else np.zeros(len(gauge_attrs))
             )
             std_values = (
                 self._static_attr_std.reindex(self._static_attribute_order).fillna(1.0).values
                 if self._static_attr_std is not None
-                else np.ones(len(attrs))
+                else np.ones(len(gauge_attrs))
             )
 
-            static_array = (attrs.values - mean_values) / (std_values + 1e-8)
+            static_array = (gauge_attrs.values - mean_values) / (std_values + 1e-8)
             static_array = np.nan_to_num(static_array, nan=0.0, posinf=0.0, neginf=0.0)
 
             if len(static_array) < self.static_feature_dim:
@@ -525,7 +525,7 @@ class AdvancedModel:
             print(f"Warning: {gauge_id} not present in meteorology data")
             return None
 
-        gauge_met = meteorology.sel(gauge_id=gauge_id)
+        gauge_meteorology = meteorology.sel(gauge_id=gauge_id)
 
         target_mask = xr.DataArray(
             np.ones(len(target_index), dtype=np.int8),
@@ -533,17 +533,17 @@ class AdvancedModel:
             dims=['time']
         )
 
-        gauge_met, _ = xr.align(gauge_met, target_mask, join='inner')
+        gauge_meteorology, _ = xr.align(gauge_meteorology, target_mask, join='inner')
 
-        if 'time' not in gauge_met.coords or gauge_met.sizes.get('time', 0) == 0:
+        if 'time' not in gauge_meteorology.coords or gauge_meteorology.sizes.get('time', 0) == 0:
             return None
 
-        met_df = gauge_met.to_dataframe().reset_index()
-        if 'gauge_id' in met_df.columns:
-            met_df = met_df.drop(columns=['gauge_id'])
-        met_df = met_df.set_index('time').sort_index()
+        meteorology_df = gauge_meteorology.to_dataframe().reset_index()
+        if 'gauge_id' in meteorology_df.columns:
+            meteorology_df = meteorology_df.drop(columns=['gauge_id'])
+        meteorology_df = meteorology_df.set_index('time').sort_index()
 
-        return met_df
+        return meteorology_df
 
     def _format_dynamic_features(
         self,
@@ -627,9 +627,9 @@ class AdvancedModel:
             return None, None, None
 
         try:
-            ds_grdc_gauge = self._grdc_data.sel(gauge_id=gauge_id)
-            targets_da = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0)
-            targets = targets_da.to_pandas()
+            gauge_dataset = self._grdc_data.sel(gauge_id=gauge_id)
+            targets_data_array = gauge_dataset[metrics_utils.OBS_VARIABLE].sel(lead_time=0)
+            targets = targets_data_array.to_pandas()
 
             if isinstance(targets, pd.DataFrame):
                 targets = targets.iloc[:, 0]
@@ -670,10 +670,10 @@ class AdvancedModel:
             static_graph_data = self._get_subgraph_for_gauge(gauge_id)
 
             if static_graph_data is None:
-                x = torch.tensor(fallback_static_array, dtype=torch.float32).unsqueeze(0)
-                augmented_x, target_mask = self._augment_with_target_indicator(x, 0)
+                node_features = torch.tensor(fallback_static_array, dtype=torch.float32).unsqueeze(0)
+                augmented_features, target_mask = self._augment_with_target_indicator(node_features, 0)
                 edge_index = torch.empty((2, 0), dtype=torch.long)
-                static_graph_data = Data(x=augmented_x, edge_index=edge_index)
+                static_graph_data = Data(x=augmented_features, edge_index=edge_index)
                 static_graph_data.target_mask = target_mask
                 static_graph_data.target_index = torch.tensor(0, dtype=torch.long)
 
@@ -828,11 +828,11 @@ class AdvancedModel:
 
             # --- 2.2 加载模板以获取时间坐标 ---
             try:
-                ds_template = loading_utils.load_google_model_for_one_gauge(
+                template_dataset = loading_utils.load_google_model_for_one_gauge(
                     experiment='full_run',
                     gauge=gauge_id
                 )
-                if ds_template is None:
+                if template_dataset is None:
                     print(f"Skipping {gauge_id}: Cannot load template file.")
                     continue
 
@@ -842,8 +842,8 @@ class AdvancedModel:
 
             # --- 2.3 运行模型推理（滑动窗口） ---
             # 我们需要为模板中的每个时间步生成预测
-            target_times = ds_template['time'].values
-            target_lead_times = ds_template['lead_time'].values
+            target_times = template_dataset['time'].values
+            target_lead_times = template_dataset['lead_time'].values
 
             # 初始化预测数组
             predictions_array = np.full(
@@ -853,18 +853,18 @@ class AdvancedModel:
 
             # 清理数据（移除 NaN）
             valid_mask = ~(dynamic_features.isna().any(axis=1) | targets.isna())
-            dynamic_features_clean = dynamic_features[valid_mask]
-            targets_clean = targets[valid_mask]
+            clean_dynamic_features = dynamic_features[valid_mask]
+            clean_targets = targets[valid_mask]
 
-            if len(dynamic_features_clean) < self.seq_length:
+            if len(clean_dynamic_features) < self.seq_length:
                 print(f"Skipping {gauge_id}: Insufficient data after cleaning.")
                 continue
 
             # 滑动窗口预测
             with torch.no_grad():
-                for i in range(len(dynamic_features_clean) - self.seq_length):
+                for i in range(len(clean_dynamic_features) - self.seq_length):
                     # 提取输入序列
-                    rnn_input_seq = dynamic_features_clean.iloc[i:i+self.seq_length].values
+                    rnn_input_seq = clean_dynamic_features.iloc[i:i+self.seq_length].values
                     rnn_input_tensor = torch.FloatTensor(rnn_input_seq).unsqueeze(0).to(self.device)  # (1, seq_length, features)
 
                     # 静态图数据
@@ -873,19 +873,19 @@ class AdvancedModel:
                     gnn_batch = Batch.from_data_list([gnn_input])
 
                     # 前向传播
-                    pred = self.model(rnn_input_tensor, gnn_batch)  # (1, output_lead_times)
-                    pred_values = pred.cpu().numpy()[0]  # (output_lead_times,)
+                    prediction = self.model(rnn_input_tensor, gnn_batch)  # (1, output_lead_times)
+                    prediction_values = prediction.cpu().numpy()[0]  # (output_lead_times,)
 
                     # 确定预测时间（窗口结束后的时间）
-                    pred_time = dynamic_features_clean.index[i + self.seq_length]
+                    prediction_time = clean_dynamic_features.index[i + self.seq_length]
 
                     # 将预测映射到 target_times
-                    if pred_time in target_times:
-                        time_idx = np.where(target_times == pred_time)[0][0]
+                    if prediction_time in target_times:
+                        time_idx = np.where(target_times == prediction_time)[0][0]
 
                         # 填充前导时间（可能少于 output_lead_times）
-                        num_lead_times_to_fill = min(len(pred_values), len(target_lead_times))
-                        predictions_array[time_idx, :num_lead_times_to_fill] = pred_values[:num_lead_times_to_fill]
+                        num_lead_times_to_fill = min(len(prediction_values), len(target_lead_times))
+                        predictions_array[time_idx, :num_lead_times_to_fill] = prediction_values[:num_lead_times_to_fill]
 
             # --- 2.4 处理缺失预测（使用简单插值或填充） ---
             # 对于没有预测的时间步，可以使用插值或填充策略
@@ -895,16 +895,16 @@ class AdvancedModel:
             # 注意：变量名需要与评估脚本兼容
             # 根据模板代码，应该使用与原始 Google 模型相同的变量名
             # 检查模板中的变量名
-            if 'sim' in ds_template.data_vars:
+            if 'sim' in template_dataset.data_vars:
                 sim_variable_name = 'sim'
-            elif metrics_utils.GOOGLE_VARIABLE in ds_template.data_vars:
+            elif metrics_utils.GOOGLE_VARIABLE in template_dataset.data_vars:
                 sim_variable_name = metrics_utils.GOOGLE_VARIABLE
             else:
                 # 使用模板中的第一个变量名
-                sim_variable_name = list(ds_template.data_vars.keys())[0]
+                sim_variable_name = list(template_dataset.data_vars.keys())[0]
                 print(f"Warning: Using variable name '{sim_variable_name}' from template.")
 
-            prediction_ds = xr.Dataset(
+            prediction_dataset = xr.Dataset(
                 {
                     sim_variable_name: (
                         ["time", "lead_time"],
@@ -913,8 +913,8 @@ class AdvancedModel:
                     )
                 },
                 coords={
-                    "time": ds_template['time'],
-                    "lead_time": ds_template['lead_time'],
+                    "time": template_dataset['time'],
+                    "lead_time": template_dataset['lead_time'],
                     "gauge_id": gauge_id
                 }
             )
@@ -922,7 +922,7 @@ class AdvancedModel:
             # --- 2.6 保存为 NetCDF 文件 ---
             output_file_path = self.output_path / f'{gauge_id}.nc'
             try:
-                prediction_ds.to_netcdf(output_file_path)
+                prediction_dataset.to_netcdf(output_file_path)
             except Exception as e:
                 print(f"Error saving {gauge_id}.nc: {e}")
                 import traceback

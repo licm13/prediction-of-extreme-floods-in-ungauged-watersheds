@@ -55,9 +55,6 @@ def save_metrics_df(
     if path_modifier is not None:
         path = path / path_modifier
 
-    # Create the directory if it does not exist.    
-    loading_utils.create_remote_folder_if_necessary(path)
-
     # Path to file.
     filepath = path / f'{metric}.csv'
 
@@ -65,7 +62,7 @@ def save_metrics_df(
     if df is None:
         return filepath
 
-    # Create the directory if necessary.
+    # Create the directory if necessary (single call, not duplicated).
     loading_utils.create_remote_folder_if_necessary(path)
 
     # Save the dataframe to csv.

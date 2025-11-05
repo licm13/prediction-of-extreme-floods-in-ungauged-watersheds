@@ -123,9 +123,9 @@ class HydroDataLoader:
             return self._static_attrs_cache[gauge_id]
 
         try:
-            attrs_df = loading_utils.load_attributes_file(gauges=[gauge_id])
-            self._static_attrs_cache[gauge_id] = attrs_df
-            return attrs_df
+            attributes_df = loading_utils.load_attributes_file(gauges=[gauge_id])
+            self._static_attrs_cache[gauge_id] = attributes_df
+            return attributes_df
         except Exception as e:
             print(f"Error loading attributes for {gauge_id}: {e}")
             return None
@@ -190,34 +190,34 @@ class HydroDataLoader:
         """
         try:
             # ===== 1. Load GRDC observations (targets) =====
-            ds_grdc = self.load_grdc_data()
+            grdc_dataset = self.load_grdc_data()
 
-            if gauge_id not in ds_grdc.gauge_id.values:
+            if gauge_id not in grdc_dataset.gauge_id.values:
                 print(f"Gauge {gauge_id} not found in GRDC data.")
                 return None, None, None
 
-            ds_grdc_gauge = ds_grdc.sel(gauge_id=gauge_id)
+            gauge_grdc_data = grdc_dataset.sel(gauge_id=gauge_id)
 
             # Extract observed discharge at lead_time=0 (synchronous observation)
-            targets = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0).to_pandas()
+            targets = gauge_grdc_data[metrics_utils.OBS_VARIABLE].sel(lead_time=0).to_pandas()
 
             # Clean invalid values
             targets = targets.replace([np.inf, -np.inf], np.nan)
 
             # ===== 2. Load static basin attributes =====
-            static_attrs_df = self.load_static_attributes(gauge_id)
+            static_attributes_df = self.load_static_attributes(gauge_id)
 
-            if static_attrs_df is None or static_attrs_df.empty:
+            if static_attributes_df is None or static_attributes_df.empty:
                 print(f"Warning: Could not load attributes for {gauge_id}")
                 print("Using random static features.")
                 static_features_array = np.random.randn(self.static_feature_dim)
             else:
                 # Handle missing values
-                static_attrs_df = static_attrs_df.fillna(static_attrs_df.mean())
-                static_attrs_df = static_attrs_df.fillna(0)
+                static_attributes_df = static_attributes_df.fillna(static_attributes_df.mean())
+                static_attributes_df = static_attributes_df.fillna(0)
 
                 # Convert to numpy array
-                static_features_array = static_attrs_df.values[0]
+                static_features_array = static_attributes_df.values[0]
 
                 # Adjust dimensionality
                 if len(static_features_array) < self.static_feature_dim:
@@ -232,12 +232,12 @@ class HydroDataLoader:
             # ===== 3. Load meteorological forcings =====
             time_index = targets.index
 
-            met_data = self.load_meteorology_data()
+            meteorology_data = self.load_meteorology_data()
 
-            if met_data is not None:
+            if meteorology_data is not None:
                 # Load real meteorology data
                 dynamic_features = self._extract_meteorology_for_gauge(
-                    met_data, gauge_id, time_index
+                    meteorology_data, gauge_id, time_index
                 )
             else:
                 # Generate simulated data (fallback)
@@ -260,14 +260,14 @@ class HydroDataLoader:
             return None, None, None
 
     def _extract_meteorology_for_gauge(self,
-                                       met_data: xr.Dataset,
+                                       meteorology_data: xr.Dataset,
                                        gauge_id: str,
                                        time_index: pd.DatetimeIndex) -> pd.DataFrame:
         """
         Extract meteorology data for a specific gauge and align to time index.
 
         Args:
-            met_data: xarray Dataset with meteorology data
+            meteorology_data: xarray Dataset with meteorology data
             gauge_id: Gauge identifier
             time_index: Target time index to align to
 
@@ -275,19 +275,19 @@ class HydroDataLoader:
             DataFrame with meteorological features aligned to time_index
         """
         # Select data for this gauge
-        if gauge_id not in met_data.gauge_id.values:
+        if gauge_id not in meteorology_data.gauge_id.values:
             print(f"Warning: {gauge_id} not in meteorology data, using simulated data")
             return self._generate_simulated_meteorology(time_index, gauge_id)
 
-        met_gauge = met_data.sel(gauge_id=gauge_id)
+        gauge_meteorology = meteorology_data.sel(gauge_id=gauge_id)
 
         # Convert to DataFrame
-        met_df = met_gauge.to_dataframe()
+        meteorology_df = gauge_meteorology.to_dataframe()
 
         # Align to target time index (using forward fill for missing times)
-        met_df = met_df.reindex(time_index, method='ffill')
+        meteorology_df = meteorology_df.reindex(time_index, method='ffill')
 
-        return met_df
+        return meteorology_df
 
     def _adjust_dynamic_features_dim(self, df: pd.DataFrame) -> pd.DataFrame:
         """Adjust dynamic features to match expected dimensionality."""
@@ -315,8 +315,8 @@ class HydroDataLoader:
 
     def get_available_gauges(self) -> list:
         """Get list of all available gauge IDs in GRDC data."""
-        ds_grdc = self.load_grdc_data()
-        return ds_grdc.gauge_id.values.tolist()
+        grdc_dataset = self.load_grdc_data()
+        return grdc_dataset.gauge_id.values.tolist()
 
 
 class PreprocessedHydroDataset:
