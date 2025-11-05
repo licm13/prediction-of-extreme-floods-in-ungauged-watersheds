@@ -4,6 +4,7 @@ import xarray as xr
 import numpy as np
 import os
 import sys
+from typing import Dict, Optional, Tuple
 from tqdm import tqdm
 
 # 确保 backend 在路径中，以便可以从 models/ 目录导入
@@ -322,6 +323,7 @@ class AdvancedModel:
         self.num_epochs = model_params.get('num_epochs', 50)
         self.seq_length = model_params.get('seq_length', 365)
         self.samples_per_gauge = model_params.get('samples_per_gauge', 10)
+        self.meteorology_file = model_params.get('meteorology_file', None)
 
         # 设置设备（GPU 或 CPU）
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -354,9 +356,205 @@ class AdvancedModel:
         loading_utils.create_remote_folder_if_necessary(self.output_path)
         loading_utils.create_remote_folder_if_necessary(self.checkpoint_path)
 
+        # 缓存核心数据以避免重复读盘
+        self._grdc_data: Optional[xr.Dataset] = None
+        self._available_gauges: set[str] = set()
+        self._static_attributes_df: Optional[pd.DataFrame] = None
+        self._static_attribute_order: Optional[list[str]] = None
+        self._static_attr_mean: Optional[pd.Series] = None
+        self._static_attr_std: Optional[pd.Series] = None
+        self._dynamic_feature_columns: Optional[list[str]] = None
+        self._meteorology_data: Optional[xr.Dataset] = None
+        self._meteorology_load_failed = False
+        self._gauge_cache: Dict[str, Tuple[pd.DataFrame, Data, pd.Series]] = {}
+
+        self._initialize_data_caches()
+
         print(f"Initializing AdvancedModel for experiment: {self.experiment_name}")
         print(f"Model outputs will be saved to: {self.output_path}")
         print(f"Model architecture: {self.model}")
+
+    def _initialize_data_caches(self) -> None:
+        """Load core datasets once and prepare shared statistics."""
+
+        self._grdc_data = loading_utils.load_grdc_data()
+        if self._grdc_data is not None and 'gauge_id' in self._grdc_data.coords:
+            self._available_gauges = set(self._grdc_data.gauge_id.values.tolist())
+        else:
+            self._available_gauges = set()
+
+        try:
+            attributes_df = loading_utils.load_attributes_file()
+            self._static_attributes_df = attributes_df.sort_index()
+            self._static_attribute_order = list(self._static_attributes_df.columns)
+            self._static_attr_mean = self._static_attributes_df.mean().astype(float).fillna(0.0)
+            self._static_attr_std = (
+                self._static_attributes_df.std(ddof=0).astype(float).replace(0, np.nan).fillna(1.0)
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Warning: Failed to load static attributes: {exc}")
+            self._static_attributes_df = None
+            self._static_attribute_order = None
+            self._static_attr_mean = None
+            self._static_attr_std = None
+
+        self._get_meteorology_dataset()
+        self._gauge_cache.clear()
+
+    def _get_meteorology_dataset(self) -> Optional[xr.Dataset]:
+        """Return cached meteorology dataset, loading if necessary."""
+
+        if self._meteorology_data is None and not self._meteorology_load_failed:
+            try:
+                self._meteorology_data = loading_utils.load_meteorology(self.meteorology_file)
+            except ValueError as exc:
+                print(f"Error validating meteorology dataset: {exc}")
+                self._meteorology_data = None
+                self._meteorology_load_failed = True
+
+            if self._meteorology_data is None:
+                self._meteorology_load_failed = True
+
+        return self._meteorology_data
+
+    def invalidate_cache(self, reload_data: bool = False) -> None:
+        """Invalidate per-gauge caches, optionally reloading backing data."""
+
+        self._gauge_cache.clear()
+        if reload_data:
+            self._meteorology_data = None
+            self._meteorology_load_failed = False
+            self._initialize_data_caches()
+
+    def _prepare_static_graph(self, gauge_id: str) -> Data:
+        """Create a PyG Data object with scaled static attributes for a gauge."""
+
+        if (
+            self._static_attributes_df is None
+            or self._static_attribute_order is None
+            or gauge_id not in self._static_attributes_df.index
+        ):
+            static_array = np.zeros(self.static_feature_dim, dtype=np.float32)
+        else:
+            attrs = self._static_attributes_df.loc[gauge_id]
+            attrs = attrs.reindex(self._static_attribute_order)
+            attrs = attrs.astype(float)
+
+            if self._static_attr_mean is not None:
+                attrs = attrs.fillna(self._static_attr_mean.reindex(self._static_attribute_order))
+            attrs = attrs.fillna(0.0)
+
+            mean_values = (
+                self._static_attr_mean.reindex(self._static_attribute_order).fillna(0.0).values
+                if self._static_attr_mean is not None
+                else np.zeros(len(attrs))
+            )
+            std_values = (
+                self._static_attr_std.reindex(self._static_attribute_order).fillna(1.0).values
+                if self._static_attr_std is not None
+                else np.ones(len(attrs))
+            )
+
+            static_array = (attrs.values - mean_values) / (std_values + 1e-8)
+            static_array = np.nan_to_num(static_array, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if len(static_array) < self.static_feature_dim:
+                padding = np.zeros(self.static_feature_dim - len(static_array), dtype=np.float32)
+                static_array = np.concatenate([static_array, padding])
+            elif len(static_array) > self.static_feature_dim:
+                static_array = static_array[:self.static_feature_dim]
+
+        static_tensor = torch.as_tensor(static_array, dtype=torch.float32).unsqueeze(0)
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        return Data(x=static_tensor, edge_index=edge_index)
+
+    def _extract_dynamic_features(
+        self,
+        gauge_id: str,
+        target_index: pd.DatetimeIndex,
+    ) -> Optional[pd.DataFrame]:
+        """Extract meteorology aligned to gauge and time index."""
+
+        meteorology = self._get_meteorology_dataset()
+        if meteorology is None or 'gauge_id' not in meteorology.coords:
+            return None
+
+        if gauge_id not in meteorology.gauge_id.values:
+            print(f"Warning: {gauge_id} not present in meteorology data")
+            return None
+
+        gauge_met = meteorology.sel(gauge_id=gauge_id)
+
+        target_mask = xr.DataArray(
+            np.ones(len(target_index), dtype=np.int8),
+            coords={'time': target_index},
+            dims=['time']
+        )
+
+        gauge_met, _ = xr.align(gauge_met, target_mask, join='inner')
+
+        if 'time' not in gauge_met.coords or gauge_met.sizes.get('time', 0) == 0:
+            return None
+
+        met_df = gauge_met.to_dataframe().reset_index()
+        if 'gauge_id' in met_df.columns:
+            met_df = met_df.drop(columns=['gauge_id'])
+        met_df = met_df.set_index('time').sort_index()
+
+        return met_df
+
+    def _format_dynamic_features(
+        self,
+        features: Optional[pd.DataFrame],
+        index: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """Ensure dynamic features are numeric, aligned, and have expected width."""
+
+        if features is None:
+            features = pd.DataFrame(index=index)
+        else:
+            features = features.reindex(index)
+
+        features = features.apply(pd.to_numeric, errors='coerce')
+        features = features.replace([np.inf, -np.inf], np.nan)
+        features = features.sort_index()
+        features = features.reindex(index)
+
+        if len(features) > 0:
+            try:
+                features = features.interpolate(method='time', limit_direction='both')
+            except Exception:
+                features = features.interpolate(limit_direction='both')
+            features = features.fillna(method='ffill').fillna(method='bfill')
+
+        features = features.fillna(0.0)
+
+        if features.shape[1] == 0:
+            columns = [f'feature_{i}' for i in range(self.dynamic_feature_dim)]
+            features = pd.DataFrame(0.0, index=index, columns=columns, dtype=np.float32)
+            self._dynamic_feature_columns = columns
+            return features
+
+        if self._dynamic_feature_columns is None:
+            existing_cols = list(features.columns)
+            extra_idx = 0
+            while len(existing_cols) < self.dynamic_feature_dim:
+                candidate = f'extra_{extra_idx}'
+                extra_idx += 1
+                if candidate in existing_cols:
+                    continue
+                features[candidate] = 0.0
+                existing_cols.append(candidate)
+
+            if len(existing_cols) > self.dynamic_feature_dim:
+                existing_cols = existing_cols[:self.dynamic_feature_dim]
+                features = features[existing_cols]
+
+            self._dynamic_feature_columns = existing_cols[:self.dynamic_feature_dim]
+        else:
+            features = features.reindex(columns=self._dynamic_feature_columns, fill_value=0.0)
+
+        return features.astype(np.float32)
 
     def _prepare_data_for_gauge(self, gauge_id: str) -> tuple:
         """
@@ -371,100 +569,69 @@ class AdvancedModel:
                 - static_graph_data: PyG Data 对象 - 静态流域属性图
                 - targets: pd.Series (time,) - 观测径流
         """
-        try:
-            # ===== 1. 加载观测数据 (目标) =====
-            ds_grdc = loading_utils.load_grdc_data()
-
-            # 检查站点是否存在
-            if gauge_id not in ds_grdc.gauge_id.values:
-                print(f"Gauge {gauge_id} not found in GRDC data.")
-                return None, None, None
-
-            ds_grdc_gauge = ds_grdc.sel(gauge_id=gauge_id)
-
-            # 提取观测径流（选择第一个前导时间作为目标，因为这是"同步"观测）
-            targets = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0).to_pandas()
-
-            # 清理无效值
-            targets = targets.replace([np.inf, -np.inf], np.nan)
-
-            # ===== 2. 加载静态流域属性 (用于 GNN) =====
-            try:
-                static_attrs_df = loading_utils.load_attributes_file(gauges=[gauge_id])
-
-                # 处理缺失值
-                static_attrs_df = static_attrs_df.fillna(static_attrs_df.mean())
-                static_attrs_df = static_attrs_df.fillna(0)  # 如果所有值都是 NaN
-
-                # 转换为 numpy 数组
-                static_features_array = static_attrs_df.values[0]  # (num_static_features,)
-
-                # 确保特征数量与模型匹配
-                if len(static_features_array) < self.static_feature_dim:
-                    # 如果特征不足，填充 0
-                    padding = np.zeros(self.static_feature_dim - len(static_features_array))
-                    static_features_array = np.concatenate([static_features_array, padding])
-                elif len(static_features_array) > self.static_feature_dim:
-                    # 如果特征过多，截断
-                    static_features_array = static_features_array[:self.static_feature_dim]
-
-            except Exception as e:
-                print(f"Warning: Could not load attributes for {gauge_id}: {e}")
-                print("Using random static features.")
-                static_features_array = np.random.randn(self.static_feature_dim)
-
-            # 标准化静态特征
-            static_features_array = (static_features_array - np.mean(static_features_array)) / (np.std(static_features_array) + 1e-8)
-
-            # ===== 3. 构建图数据（per-gauge：单节点图）=====
-            # 每个流域是一个单独的节点，没有边
-            x = torch.FloatTensor(static_features_array).unsqueeze(0)  # (1, static_feature_dim)
-            edge_index = torch.tensor([[], []], dtype=torch.long)  # 空边列表
-
-            static_graph_data = Data(x=x, edge_index=edge_index)
-
-            # ===== 4. 创建动态特征（气象输入）=====
-            # 注意：在实际应用中，这里应该加载真实的气象数据
-            # 由于示例中没有提供气象数据加载函数，我们创建模拟数据
-
-            # 创建与 targets 时间索引对齐的模拟气象数据
-            time_index = targets.index
-
-            # 模拟 5 个气象特征：降水、温度、潜在蒸散发、土壤湿度、积雪
-            np.random.seed(hash(gauge_id) % (2**32))  # 为每个站点设置可重复的随机种子
-
-            dynamic_features = pd.DataFrame(
-                {
-                    'precip': np.abs(np.random.randn(len(time_index)) * 5 + 2),  # 降水（非负）
-                    'temp': np.random.randn(len(time_index)) * 10 + 15,  # 温度
-                    'pet': np.abs(np.random.randn(len(time_index)) * 2 + 3),  # 潜在蒸散发
-                    'soil_moisture': np.random.rand(len(time_index)) * 0.5 + 0.2,  # 土壤湿度 [0.2, 0.7]
-                    'snow': np.abs(np.random.randn(len(time_index)) * 3),  # 积雪
-                },
-                index=time_index
+        if gauge_id in self._gauge_cache:
+            cached_dynamic, cached_static, cached_targets = self._gauge_cache[gauge_id]
+            return (
+                cached_dynamic.copy(deep=True),
+                cached_static.clone(),
+                cached_targets.copy(deep=True),
             )
 
-            # 确保特征数量与模型匹配
-            if dynamic_features.shape[1] != self.dynamic_feature_dim:
-                print(f"Warning: Dynamic features have {dynamic_features.shape[1]} columns, "
-                      f"but model expects {self.dynamic_feature_dim}. Adjusting...")
+        if not self._available_gauges:
+            self._initialize_data_caches()
 
-                if dynamic_features.shape[1] < self.dynamic_feature_dim:
-                    # 添加额外的随机特征
-                    for i in range(self.dynamic_feature_dim - dynamic_features.shape[1]):
-                        dynamic_features[f'extra_{i}'] = np.random.randn(len(time_index))
-                else:
-                    # 截断
-                    dynamic_features = dynamic_features.iloc[:, :self.dynamic_feature_dim]
+        if gauge_id not in self._available_gauges:
+            print(f"Gauge {gauge_id} not found in GRDC data.")
+            return None, None, None
+
+        try:
+            ds_grdc_gauge = self._grdc_data.sel(gauge_id=gauge_id)
+            targets_da = ds_grdc_gauge[metrics_utils.OBS_VARIABLE].sel(lead_time=0)
+            targets = targets_da.to_pandas()
+
+            if isinstance(targets, pd.DataFrame):
+                targets = targets.iloc[:, 0]
+
+            targets = targets.replace([np.inf, -np.inf], np.nan).dropna()
+            targets = targets.sort_index()
+
+            if targets.empty:
+                print(f"Warning: No valid observations for {gauge_id}")
+                return None, None, None
+
+            dynamic_features = self._extract_dynamic_features(gauge_id, targets.index)
+
+            if dynamic_features is not None and not dynamic_features.empty:
+                common_index = targets.index.intersection(dynamic_features.index)
+                targets = targets.loc[common_index]
+                dynamic_features = dynamic_features.loc[common_index]
+            else:
+                common_index = targets.index
+
+            if len(common_index) == 0:
+                print(f"Warning: No overlapping meteorology for {gauge_id}")
+                return None, None, None
+
+            targets = targets.loc[common_index]
+            dynamic_features = self._format_dynamic_features(dynamic_features, targets.index)
+            targets = targets.astype(np.float32)
+
+            static_graph_data = self._prepare_static_graph(gauge_id)
+
+            cache_entry = (
+                dynamic_features.copy(deep=True),
+                static_graph_data.clone(),
+                targets.copy(deep=True),
+            )
+            self._gauge_cache[gauge_id] = cache_entry
 
             return dynamic_features, static_graph_data, targets
 
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             print(f"Error loading data for gauge {gauge_id}: {e}")
             import traceback
             traceback.print_exc()
             return None, None, None
-
 
     def train(self, training_gauge_ids: list[str]):
         """

@@ -166,6 +166,54 @@ def _load_netcdf(
     return data
 
 
+def load_meteorology(
+    file_path: Optional[pathlib.Path] = None,
+) -> Optional[xarray.Dataset]:
+    """Load meteorological forcings with required coordinates."""
+
+    if file_path is None:
+        file_path = data_paths.METEOROLOGY_FILE
+    else:
+        file_path = pathlib.Path(file_path)
+
+    if file_path is None or not file_path.exists():
+        print(f"Warning: Meteorology file not found at {file_path}")
+        return None
+
+    try:
+        dataset = xarray.load_dataset(file_path)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Error loading meteorology file {file_path}: {exc}")
+        return None
+
+    if 'gauge_id' not in dataset.coords:
+        rename_candidates = ['gauge', 'gauge_ids', 'station_id', 'id']
+        rename_key = next((candidate for candidate in rename_candidates if candidate in dataset.coords), None)
+        if rename_key is not None:
+            dataset = dataset.rename({rename_key: 'gauge_id'})
+        else:
+            raise ValueError(
+                "Meteorology dataset must include a 'gauge_id' coordinate."
+            )
+
+    if 'time' not in dataset.coords:
+        time_candidates = ['date', 'datetime']
+        rename_key = next((candidate for candidate in time_candidates if candidate in dataset.coords), None)
+        if rename_key is not None:
+            dataset = dataset.rename({rename_key: 'time'})
+        else:
+            raise ValueError(
+                "Meteorology dataset must include a 'time' coordinate."
+            )
+
+    # Sort for deterministic alignment downstream.
+    dataset = dataset.sortby('time')
+    if 'gauge_id' in dataset.dims:
+        dataset = dataset.sortby('gauge_id')
+
+    return dataset
+
+
 def _load_gauge(
     results_file: pathlib.Path,
     time_period: Optional[list[str]] = None,
