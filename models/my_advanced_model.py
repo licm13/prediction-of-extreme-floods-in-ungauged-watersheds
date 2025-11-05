@@ -35,6 +35,7 @@ import torch_geometric
 from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader as GeometricDataLoader
+from torch_geometric.utils import k_hop_subgraph
 
 
 # ==================== Model Architecture ====================
@@ -131,19 +132,29 @@ class HybridGNN_RNN(nn.Module):
         batch_idx = static_graph_batch.batch
 
         # GNN 层
-        x_static = self.gnn_conv1(x_static, edge_index)
+        edge_weight = getattr(static_graph_batch, 'edge_weight', None)
+
+        x_static = self.gnn_conv1(x_static, edge_index, edge_weight)
         x_static = self.gnn_bn1(x_static)
         x_static = self.relu(x_static)
         x_static = self.dropout(x_static)
 
-        x_static = self.gnn_conv2(x_static, edge_index)
+        x_static = self.gnn_conv2(x_static, edge_index, edge_weight)
         x_static = self.gnn_bn2(x_static)
         x_static = self.relu(x_static)
 
-        # 由于每个图只有一个节点（per-gauge），直接使用节点特征
-        # 如果需要聚合多个节点，可以使用: x_static = global_mean_pool(x_static, batch_idx)
-        # 但在我们的情况下，每个样本只有一个节点
-        gnn_embedding = x_static  # (batch_size, gnn_hidden_dim)
+        # 提取目标节点的嵌入（每个图一个目标节点）
+        if hasattr(static_graph_batch, 'target_mask'):
+            target_mask = static_graph_batch.target_mask
+            if target_mask.dtype != torch.bool:
+                target_mask = target_mask.bool()
+            gnn_embedding = x_static[target_mask]
+        else:
+            gnn_embedding = global_mean_pool(x_static, batch_idx)
+
+        # 如果掩码提取失败（例如缺失目标节点），退化为图级平均
+        if gnn_embedding.shape[0] != dynamic_features.shape[0]:
+            gnn_embedding = global_mean_pool(x_static, batch_idx)
 
         # ===== RNN 部分 =====
         # 处理动态时间序列
@@ -341,7 +352,7 @@ class AdvancedModel:
         self.experiment_name = experiment_name
 
         # 提取超参数（带默认值）
-        self.static_feature_dim = model_params.get('static_feature_dim', 50)
+        self.config_static_feature_dim = model_params.get('static_feature_dim', 50)
         self.dynamic_feature_dim = model_params.get('dynamic_feature_dim', 5)
         self.gnn_hidden_dim = model_params.get('gnn_hidden_dim', 64)
         self.rnn_hidden_dim = model_params.get('rnn_hidden_dim', 128)
@@ -655,6 +666,16 @@ class AdvancedModel:
                 targets.copy(deep=True),
             )
             self._gauge_cache[gauge_id] = cache_entry
+
+            static_graph_data = self._get_subgraph_for_gauge(gauge_id)
+
+            if static_graph_data is None:
+                x = torch.tensor(fallback_static_array, dtype=torch.float32).unsqueeze(0)
+                augmented_x, target_mask = self._augment_with_target_indicator(x, 0)
+                edge_index = torch.empty((2, 0), dtype=torch.long)
+                static_graph_data = Data(x=augmented_x, edge_index=edge_index)
+                static_graph_data.target_mask = target_mask
+                static_graph_data.target_index = torch.tensor(0, dtype=torch.long)
 
             return dynamic_features, static_graph_data, targets
 
