@@ -370,6 +370,35 @@ def beta_kge(obs: DataArray, sim: DataArray) -> float:
   return float(sim.mean() / obs.mean())
 
 
+def _calculate_kge_components(
+    obs: DataArray,
+    sim: DataArray,
+    weights: List[float]
+) -> float:
+  """Helper function to calculate KGE from correlation, alpha, and beta.
+  
+  Args:
+    obs: Observed time series (already validated and masked).
+    sim: Simulated time series (already validated and masked).
+    weights: Weighting factors of the 3 KGE parts.
+    
+  Returns:
+    Kling-Gupta Efficiency value.
+  """
+  if len(obs) < 2:
+    return np.nan
+  
+  correlation = np.corrcoef(obs.values, sim.values)[0, 1]
+  alpha_ratio = sim.std() / obs.std()
+  beta_ratio = sim.mean() / obs.mean()
+  
+  weighted_sum = (weights[0] * (correlation - 1)**2 + 
+                  weights[1] * (alpha_ratio - 1)**2 + 
+                  weights[2] * (beta_ratio - 1)**2)
+  
+  return 1 - np.sqrt(float(weighted_sum))
+
+
 def kge(
     obs: DataArray,
     sim: DataArray,
@@ -395,18 +424,7 @@ def kge(
   # get time series with only valid observations
   obs, sim = _mask_valid(obs, sim)
 
-  if len(obs) < 2:
-    return np.nan
-
-  r = np.corrcoef(obs.values, sim.values)[0, 1]
-
-  alpha = sim.std() / obs.std()
-  beta = sim.mean() / obs.mean()
-
-  value = (weights[0] * (r - 1)**2 + weights[1] * 
-           (alpha - 1)**2 + weights[2] * (beta - 1)**2)
-
-  return 1 - np.sqrt(float(value))
+  return _calculate_kge_components(obs, sim, weights)
 
 
 def log_kge(
@@ -414,7 +432,7 @@ def log_kge(
     sim: DataArray,
     weights: List[float] = _UNIFORM_WEIGHTS
 ) -> float:
-  """Calculate the Kling-Gupta Efficieny.
+  """Calculate the Kling-Gupta Efficieny on log-transformed values.
 
   Args:
     obs: Observed time series.
@@ -423,7 +441,7 @@ def log_kge(
       weight of 1.
 
   Returns:
-    Kling-Gupta Efficiency
+    Kling-Gupta Efficiency of log-transformed values
   """
   # Log transform inputs
   obs = np.log10(np.maximum(1e-4, obs))
@@ -438,18 +456,7 @@ def log_kge(
   # get time series with only valid observations
   obs, sim = _mask_valid(obs, sim)
 
-  if len(obs) < 2:
-    return np.nan
-
-  r = np.corrcoef(obs.values, sim.values)[0, 1]
-
-  alpha = sim.std() / obs.std()
-  beta = sim.mean() / obs.mean()
-
-  value = (weights[0] * (r - 1)**2 + weights[1] * (alpha - 1)**2 +
-           weights[2] * (beta - 1)**2)
-
-  return 1 - np.sqrt(float(value))
+  return _calculate_kge_components(obs, sim, weights)
 
 
 def pearsonr(
@@ -659,16 +666,16 @@ def missed_peaks(
 def fdc_fms(
     obs: DataArray, 
     sim: DataArray, 
-    lower: float = 0.2, 
-    upper: float = 0.7
+    lower_percentile: float = 0.2, 
+    upper_percentile: float = 0.7
 ) -> float:
   """Calculate the slope of the middle section of the flow duration curve.
 
   Args:
     obs: Observed time series.
     sim: Simulated time series.
-    lower: Lower bound of the middle section in range ]0,1[, by default 0.2
-    upper: Upper bound of the middle section in range ]0,1[, by default 0.7
+    lower_percentile: Lower bound of the middle section in range ]0,1[, by default 0.2
+    upper_percentile: Upper bound of the middle section in range ]0,1[, by default 0.7
 
   Returns:
     Slope of the middle section of the flow duration curve.
@@ -682,11 +689,11 @@ def fdc_fms(
   if len(obs) < 1:
     return np.nan
 
-  if any([(x <= 0) or (x >= 1) for x in [upper, lower]]):
-    raise ValueError('upper and lower have to be in range ]0,1[')
+  if any([(x <= 0) or (x >= 1) for x in [upper_percentile, lower_percentile]]):
+    raise ValueError('upper_percentile and lower_percentile have to be in range ]0,1[')
 
-  if lower >= upper:
-    raise ValueError('The lower threshold has to be smaller than the upper.')
+  if lower_percentile >= upper_percentile:
+    raise ValueError('The lower_percentile threshold has to be smaller than the upper_percentile.')
 
   # Get arrays of sorted (descending) discharges
   obs = _get_fdc(obs)
@@ -698,23 +705,23 @@ def fdc_fms(
   obs[obs == 0] = 1e-6
 
   # Calculate fms part by part
-  qsm_lower = np.log(sim[np.round(lower * len(sim)).astype(int)])
-  qsm_upper = np.log(sim[np.round(upper * len(sim)).astype(int)])
-  qom_lower = np.log(obs[np.round(lower * len(obs)).astype(int)])
-  qom_upper = np.log(obs[np.round(upper * len(obs)).astype(int)])
+  sim_lower_value = np.log(sim[np.round(lower_percentile * len(sim)).astype(int)])
+  sim_upper_value = np.log(sim[np.round(upper_percentile * len(sim)).astype(int)])
+  obs_lower_value = np.log(obs[np.round(lower_percentile * len(obs)).astype(int)])
+  obs_upper_value = np.log(obs[np.round(upper_percentile * len(obs)).astype(int)])
 
-  fms = ((qsm_lower - qsm_upper) - (qom_lower - qom_upper)) / (qom_lower - qom_upper + 1e-6)
+  fms = ((sim_lower_value - sim_upper_value) - (obs_lower_value - obs_upper_value)) / (obs_lower_value - obs_upper_value + 1e-6)
 
   return fms * 100
 
 
-def fdc_fhv(obs: DataArray, sim: DataArray, h: float = 0.02) -> float:
+def fdc_fhv(obs: DataArray, sim: DataArray, high_flow_fraction: float = 0.02) -> float:
   """Calculate the peak flow bias of the flow duration curve.
 
   Args:
     obs: Observed time series.
     sim: Simulated time series.
-    h: Fraction of  flows to consider as high flows.
+    high_flow_fraction: Fraction of flows to consider as high flows.
 
   Returns:
     Peak flow bias.
@@ -728,16 +735,16 @@ def fdc_fhv(obs: DataArray, sim: DataArray, h: float = 0.02) -> float:
   if len(obs) < 1:
     return np.nan
 
-  if (h <= 0) or (h >= 1):
-    raise ValueError('h must be in range [0, 1].')
+  if (high_flow_fraction <= 0) or (high_flow_fraction >= 1):
+    raise ValueError('high_flow_fraction must be in range [0, 1].')
 
   # get arrays of sorted (descending) discharges
   obs = _get_fdc(obs)
   sim = _get_fdc(sim)
 
-  # subset data to only top h flow values
-  obs = obs[:np.round(h * len(obs)).astype(int)]
-  sim = sim[:np.round(h * len(sim)).astype(int)]
+  # subset data to only top high_flow_fraction flow values
+  obs = obs[:np.round(high_flow_fraction * len(obs)).astype(int)]
+  sim = sim[:np.round(high_flow_fraction * len(sim)).astype(int)]
 
   fhv = np.sum(sim - obs) / np.sum(obs)
 
@@ -747,14 +754,14 @@ def fdc_fhv(obs: DataArray, sim: DataArray, h: float = 0.02) -> float:
 def fdc_flv(
     obs: DataArray,
     sim: DataArray,
-    l: float = 0.3
+    low_flow_fraction: float = 0.3
 ) -> float:
   """Calculate the low flow bias of the flow duration curve.
 
   Args:
     obs: Observed time series.
     sim: Simulated time series.
-    l: Fraction of flows to consider as low flows.
+    low_flow_fraction: Fraction of flows to consider as low flows.
 
   Returns:
     Low flow bias.
@@ -768,8 +775,8 @@ def fdc_flv(
   if len(obs) < 1:
     return np.nan
 
-  if (l <= 0) or (l >= 1):
-    raise ValueError('l must be in range [0, 1].')
+  if (low_flow_fraction <= 0) or (low_flow_fraction >= 1):
+    raise ValueError('low_flow_fraction must be in range [0, 1].')
 
   # Get arrays of sorted (descending) discharges
   obs = _get_fdc(obs)
@@ -780,18 +787,18 @@ def fdc_flv(
   sim[sim <= 0] = 1e-6
   obs[obs == 0] = 1e-6
 
-  obs = obs[-np.round(l * len(obs)).astype(int) :]
-  sim = sim[-np.round(l * len(sim)).astype(int) :]
+  obs = obs[-np.round(low_flow_fraction * len(obs)).astype(int) :]
+  sim = sim[-np.round(low_flow_fraction * len(sim)).astype(int) :]
 
   # Transform values to log scale
   obs = np.log(obs)
   sim = np.log(sim)
 
   # Calculate flv part by part
-  qsl = np.sum(sim - sim.min())
-  qol = np.sum(obs - obs.min())
+  sim_low_sum = np.sum(sim - sim.min())
+  obs_low_sum = np.sum(obs - obs.min())
 
-  flv = -1 * (qsl - qol) / (qol + 1e-6)
+  flv = -1 * (sim_low_sum - obs_low_sum) / (obs_low_sum + 1e-6)
 
   return flv * 100
 
