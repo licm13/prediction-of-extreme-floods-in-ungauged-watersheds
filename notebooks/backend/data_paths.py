@@ -30,6 +30,7 @@ GLOFAS_MODEL_RUNS = _WORKING_DIR / 'model_data' / 'GRDCstattions_GloFASv40' / 'd
 
 GRDC_DATA_DOWNLOAD_DIRECTORY = pathlib.Path('/home/gsnearing/data/grdc_data')
 GRDC_DATA_FILE = _WORKING_DIR / 'grdc_data' / 'GRDC-Daily.nc'
+METEOROLOGY_FILE = _WORKING_DIR / 'meteorology.nc'
 
 # ---- Metadata ----------------------------------------------------------------
 
