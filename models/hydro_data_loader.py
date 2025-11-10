@@ -332,7 +332,7 @@ class HydroDataLoader:
             return (df - self._global_dynamic_mean) / self._global_dynamic_std
         else:
             # Fall back to per-gauge normalization (not recommended for ML)
-            print("Warning: Using per-gauge normalization. Call fit_normalization() first for proper ML workflow.")
+            logging.warning("Using per-gauge normalization. Call fit_normalization() first for proper ML workflow.")
             return (df - df.mean()) / (df.std() + 1e-8)
 
     def get_available_gauges(self) -> list:
