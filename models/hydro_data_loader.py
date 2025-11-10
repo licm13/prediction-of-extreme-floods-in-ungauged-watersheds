@@ -62,11 +62,14 @@ class HydroDataLoader:
         self._meteorology_cache = None
         self._static_attrs_cache = {}
 
-        # Statistics for normalization (computed on first load)
-        self._static_mean = None
-        self._static_std = None
-        self._dynamic_mean = None
-        self._dynamic_std = None
+        # Global statistics for normalization (computed via fit_normalization)
+        # These should be computed on the training set and applied consistently
+        # to training, validation, and test sets
+        self._global_static_mean = None
+        self._global_static_std = None
+        self._global_dynamic_mean = None
+        self._global_dynamic_std = None
+        self._normalization_fitted = False
 
     def load_grdc_data(self) -> xr.Dataset:
         """Load GRDC observation data (cached)."""
@@ -301,22 +304,123 @@ class HydroDataLoader:
         return df
 
     def _normalize_static_features(self, features: np.ndarray) -> np.ndarray:
-        """Normalize static features using z-score normalization."""
-        return (features - np.mean(features)) / (np.std(features) + 1e-8)
+        """
+        Normalize static features using z-score normalization.
+
+        If global statistics have been fitted (via fit_normalization),
+        uses those. Otherwise, falls back to per-sample normalization.
+        """
+        if self._normalization_fitted and self._global_static_mean is not None:
+            return (features - self._global_static_mean) / self._global_static_std
+        else:
+            # Fall back to per-sample normalization (not recommended for ML)
+            return (features - np.mean(features)) / (np.std(features) + 1e-8)
 
     def _normalize_dynamic_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Normalize dynamic features.
+        Normalize dynamic features using z-score normalization.
 
-        In production, you should compute statistics on training set
-        and apply them consistently to validation/test sets.
+        If global statistics have been fitted (via fit_normalization),
+        uses those. Otherwise, falls back to per-gauge normalization.
+
+        IMPORTANT: For proper machine learning, you should:
+        1. Call fit_normalization() on the training set ONCE
+        2. Then use prepare_data_for_gauge() for all train/val/test sets
+        This ensures consistent normalization across all data splits.
         """
-        return (df - df.mean()) / (df.std() + 1e-8)
+        if self._normalization_fitted and self._global_dynamic_mean is not None:
+            return (df - self._global_dynamic_mean) / self._global_dynamic_std
+        else:
+            # Fall back to per-gauge normalization (not recommended for ML)
+            logging.warning("Using per-gauge normalization. Call fit_normalization() first for proper ML workflow.")
+            return (df - df.mean()) / (df.std() + 1e-8)
 
     def get_available_gauges(self) -> list:
         """Get list of all available gauge IDs in GRDC data."""
         grdc_dataset = self.load_grdc_data()
         return grdc_dataset.gauge_id.values.tolist()
+
+    def fit_normalization(self, training_gauge_ids: list[str]) -> None:
+        """
+        Compute global normalization statistics from training gauges.
+
+        This method should be called ONCE on the training set before any data
+        preprocessing. The computed statistics will be used consistently across
+        training, validation, and test sets.
+
+        Args:
+            training_gauge_ids: List of gauge IDs in the training set
+        """
+        print(f"Computing global normalization statistics from {len(training_gauge_ids)} training gauges...")
+
+        # Collect all static and dynamic features
+        all_static_features = []
+        all_dynamic_features = []
+
+        for gauge_id in training_gauge_ids:
+            # Load static attributes
+            static_attributes_df = self.load_static_attributes(gauge_id)
+            if static_attributes_df is not None and not static_attributes_df.empty:
+                static_attributes_df = static_attributes_df.fillna(static_attributes_df.mean())
+                static_attributes_df = static_attributes_df.fillna(0)
+                static_features_array = static_attributes_df.values[0]
+
+                # Adjust dimensionality
+                if len(static_features_array) < self.static_feature_dim:
+                    padding = np.zeros(self.static_feature_dim - len(static_features_array))
+                    static_features_array = np.concatenate([static_features_array, padding])
+                elif len(static_features_array) > self.static_feature_dim:
+                    static_features_array = static_features_array[:self.static_feature_dim]
+
+                all_static_features.append(static_features_array)
+
+            # Load GRDC observations to get time index
+            grdc_dataset = self.load_grdc_data()
+            if gauge_id not in grdc_dataset.gauge_id.values:
+                continue
+
+            gauge_grdc_data = grdc_dataset.sel(gauge_id=gauge_id)
+            targets = gauge_grdc_data[metrics_utils.OBS_VARIABLE].sel(lead_time=0).to_pandas()
+            targets = targets.replace([np.inf, -np.inf], np.nan)
+            time_index = targets.index
+
+            # Load meteorology
+            meteorology_data = self.load_meteorology_data()
+            if meteorology_data is not None:
+                dynamic_features = self._extract_meteorology_for_gauge(
+                    meteorology_data, gauge_id, time_index
+                )
+            else:
+                dynamic_features = self._generate_simulated_meteorology(time_index, gauge_id)
+
+            # Ensure correct number of features
+            if dynamic_features.shape[1] != self.dynamic_feature_dim:
+                dynamic_features = self._adjust_dynamic_features_dim(dynamic_features)
+
+            all_dynamic_features.append(dynamic_features.values)
+
+        # Compute global statistics
+        if all_static_features:
+            static_array = np.vstack(all_static_features)
+            self._global_static_mean = np.mean(static_array, axis=0)
+            self._global_static_std = np.std(static_array, axis=0) + 1e-8
+        else:
+            self._global_static_mean = np.zeros(self.static_feature_dim)
+            self._global_static_std = np.ones(self.static_feature_dim)
+
+        if all_dynamic_features:
+            # Concatenate all dynamic features
+            dynamic_array = np.vstack(all_dynamic_features)
+            self._global_dynamic_mean = np.mean(dynamic_array, axis=0)
+            self._global_dynamic_std = np.std(dynamic_array, axis=0) + 1e-8
+        else:
+            self._global_dynamic_mean = np.zeros(self.dynamic_feature_dim)
+            self._global_dynamic_std = np.ones(self.dynamic_feature_dim)
+
+        self._normalization_fitted = True
+        print("Global normalization statistics computed successfully!")
+        print(f"Static features - Mean: {self._global_static_mean[:5]}... Std: {self._global_static_std[:5]}...")
+        print(f"Dynamic features - Mean: {self._global_dynamic_mean}  Std: {self._global_dynamic_std}")
 
 
 class PreprocessedHydroDataset:
