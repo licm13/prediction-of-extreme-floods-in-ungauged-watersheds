@@ -113,18 +113,16 @@ class HybridGNN_RNN(nn.Module):
         x_static = self.relu(x_static)
 
         # Extract target node embeddings (one target node per graph)
-        if hasattr(static_graph_batch, 'target_mask'):
+        # Extract target node embeddings (one target node per graph)
+        use_target_mask = hasattr(static_graph_batch, 'target_mask')
+        if use_target_mask:
             target_mask = static_graph_batch.target_mask
             if target_mask.dtype != torch.bool:
                 target_mask = target_mask.bool()
             gnn_embedding = x_static[target_mask]
-        else:
-            from torch_geometric.nn import global_mean_pool
-            gnn_embedding = global_mean_pool(x_static, batch_idx)
 
-        # If mask extraction failed, fall back to graph-level pooling
-        if gnn_embedding.shape[0] != dynamic_features.shape[0]:
-            from torch_geometric.nn import global_mean_pool
+        # If no target mask or if mask extraction failed, fall back to graph-level pooling
+        if not use_target_mask or gnn_embedding.shape[0] != dynamic_features.shape[0]:
             gnn_embedding = global_mean_pool(x_static, batch_idx)
 
         # ===== RNN Part =====
