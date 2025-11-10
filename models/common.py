@@ -179,8 +179,8 @@ def collate_fn(batch):
 
     rnn_inputs, gnn_graphs, targets = zip(*filtered_batch)
 
-    rnn_batch = torch.stack(list(rnn_inputs))
-    gnn_batch = Batch.from_data_list(list(gnn_graphs))
-    target_batch = torch.stack(list(targets))
+    rnn_batch = torch.stack(rnn_inputs)
+    gnn_batch = Batch.from_data_list(gnn_graphs)
+    target_batch = torch.stack(targets)
 
     return rnn_batch, gnn_batch, target_batch
