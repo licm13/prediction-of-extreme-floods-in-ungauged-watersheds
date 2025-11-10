@@ -195,6 +195,22 @@ def _get_fdc(
   return da.sortby(da, ascending=False).values
 
 
+def _calculate_nse_base(obs: DataArray, sim: DataArray) -> float:
+  """Helper function to calculate NSE core computation.
+
+  Args:
+    obs: DataArray of observed time series (already validated and masked).
+    sim: DataArray of simulated time series (already validated and masked).
+
+  Returns:
+    Nash-Sutcliffe Efficiency value.
+  """
+  denominator = ((obs - obs.mean()) ** 2).sum()
+  numerator = ((sim - obs) ** 2).sum()
+  value = 1 - numerator / denominator
+  return float(value)
+
+
 def nse(
     obs: DataArray,
     sim: DataArray
@@ -221,17 +237,14 @@ def nse(
   _validate_inputs(obs, sim)
   # get time series with only valid observations
   obs, sim = _mask_valid(obs, sim)
-  denominator = ((obs - obs.mean()) ** 2).sum()
-  numerator = ((sim - obs) ** 2).sum()
-  value = 1 - numerator / denominator
-  return float(value)
+  return _calculate_nse_base(obs, sim)
 
 
 def log_nse(
     obs: DataArray,
     sim: DataArray
 ) -> float:
-  """Calculate Nash-Sutcliffe Efficiency.
+  """Calculate log-transformed Nash-Sutcliffe Efficiency.
 
   Nash-Sutcliffe Efficiency is the R-square between observed and simulated
   discharge.
@@ -247,7 +260,7 @@ def log_nse(
     sim: DataArray of simulated time series.
 
   Returns:
-    Nash-Sutcliffe Efficiency
+    Log-transformed Nash-Sutcliffe Efficiency
   """
   # Log transform inputs
   obs = np.log10(np.maximum(1e-4, obs))
@@ -258,10 +271,7 @@ def log_nse(
 
   # get time series with only valid observations
   obs, sim = _mask_valid(obs, sim)
-  denominator = ((obs - obs.mean()) ** 2).sum()
-  numerator = ((sim - obs) ** 2).sum()
-  value = 1 - numerator / denominator
-  return float(value)
+  return _calculate_nse_base(obs, sim)
 
 
 def mse(
@@ -895,6 +905,52 @@ def calculate_all_metrics(
   return results
 
 
+# Dictionary mapping metric names to their calculation functions
+# Metrics requiring additional parameters (resolution, datetime_coord) are handled separately
+_METRIC_FUNCTIONS = {
+    'nse': nse,
+    'log-nse': log_nse,
+    'mse': mse,
+    'rmse': rmse,
+    'kge': kge,
+    'log-kge': log_kge,
+    'alpha-nse': alpha_nse,
+    'beta-kge': beta_kge,
+    'beta-nse': beta_nse,
+    'pearson-r': pearsonr,
+    'flv': fdc_flv,
+    'fhv': fdc_fhv,
+    'fms': fdc_fms,
+    'peak-mape': mean_absolute_percentage_peak_error,
+}
+
+# Metrics that require resolution and datetime_coord parameters
+_TEMPORAL_METRICS = {
+    'peak-timing': mean_peak_timing,
+    'missed-peaks': missed_peaks,
+}
+
+# Mapping from lowercase to properly capitalized metric names for output
+_METRIC_NAME_MAPPING = {
+    'nse': 'NSE',
+    'log-nse': 'log-NSE',
+    'mse': 'MSE',
+    'rmse': 'RMSE',
+    'kge': 'KGE',
+    'log-kge': 'log-KGE',
+    'alpha-nse': 'Alpha-NSE',
+    'beta-kge': 'Beta-KGE',
+    'beta-nse': 'Beta-NSE',
+    'pearson-r': 'Pearson-r',
+    'peak-timing': 'Peak-Timing',
+    'missed-peaks': 'Missed-Peaks',
+    'flv': 'FLV',
+    'fhv': 'FHV',
+    'fms': 'FMS',
+    'peak-mape': 'Peak-MAPE',
+}
+
+
 def calculate_metrics(
     obs: DataArray,
     sim: DataArray,
@@ -930,42 +986,19 @@ def calculate_metrics(
 
   values = {}
   for metric in metrics:
-    if metric.lower() == 'nse':
-      values['NSE'] = nse(obs, sim)
-    elif metric.lower() == 'log-nse':
-      values['log-NSE'] = log_nse(obs, sim)
-    elif metric.lower() == 'mse':
-      values['MSE'] = mse(obs, sim)
-    elif metric.lower() == 'rmse':
-      values['RMSE'] = rmse(obs, sim)
-    elif metric.lower() == 'kge':
-      values['KGE'] = kge(obs, sim)
-    elif metric.lower() == 'log-kge':
-      values['log-KGE'] = log_kge(obs, sim)
-    elif metric.lower() == 'alpha-nse':
-      values['Alpha-NSE'] = alpha_nse(obs, sim)
-    elif metric.lower() == 'beta-kge':
-      values['Beta-KGE'] = beta_kge(obs, sim)
-    elif metric.lower() == 'beta-nse':
-      values['Beta-NSE'] = beta_nse(obs, sim)
-    elif metric.lower() == 'pearson-r':
-      values['Pearson-r'] = pearsonr(obs, sim)
-    elif metric.lower() == 'peak-timing':
-      values['Peak-Timing'] = mean_peak_timing(
+    metric_lower = metric.lower()
+
+    # Get the properly formatted metric name
+    metric_name = _METRIC_NAME_MAPPING.get(metric_lower, metric)
+
+    # Check if it's a standard metric (no extra parameters)
+    if metric_lower in _METRIC_FUNCTIONS:
+      values[metric_name] = _METRIC_FUNCTIONS[metric_lower](obs, sim)
+    # Check if it's a temporal metric (requires resolution and datetime_coord)
+    elif metric_lower in _TEMPORAL_METRICS:
+      values[metric_name] = _TEMPORAL_METRICS[metric_lower](
           obs, sim, resolution=resolution, datetime_coord=datetime_coord
       )
-    elif metric.lower() == 'missed-peaks':
-      values['Missed-Peaks'] = missed_peaks(
-          obs, sim, resolution=resolution, datetime_coord=datetime_coord
-      )
-    elif metric.lower() == 'flv':
-      values['FLV'] = fdc_flv(obs, sim)
-    elif metric.lower() == 'fhv':
-      values['FHV'] = fdc_fhv(obs, sim)
-    elif metric.lower() == 'fms':
-      values['FMS'] = fdc_fms(obs, sim)
-    elif metric.lower() == "peak-mape":
-      values["Peak-MAPE"] = mean_absolute_percentage_peak_error(obs, sim)
     else:
       raise RuntimeError(f'Unknown metric {metric}')
 

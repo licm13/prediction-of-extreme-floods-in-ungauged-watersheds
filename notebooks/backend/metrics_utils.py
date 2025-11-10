@@ -187,7 +187,7 @@ def _metrics_for_one_gauge(
     return pd.concat(series_at_lead_time, axis=1)
 
 
-def _calculate_and_save_metrics_for_one_gague(
+def _calculate_and_save_metrics_for_one_gauge(
     ds: xarray.Dataset,
     gauge: str,
     sim_variable: str,
@@ -198,7 +198,7 @@ def _calculate_and_save_metrics_for_one_gague(
     time_period: Optional[list[str]] = None,
     path_modifier: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Calculates metrics for many gauges."""
+    """Calculates metrics for a single gauge."""
 
     # If a list of metrics is not provided, calculate all metrics.
     if metrics_to_calculate is None:
@@ -235,13 +235,13 @@ def _calculate_and_save_metrics_for_one_gague(
     return gauge_metrics_df
 
 
-def calculate_and_save_metrics_for_many_gagues(
+def calculate_and_save_metrics_for_many_gauges(
     ds: xarray.Dataset,
     gauges: str,
     sim_variable: str,
     obs_variable: str,
-    base_path: pathlib.Path,
-    breakpoints_path: pathlib.Path,
+    aggregated_metrics_path: pathlib.Path,
+    per_gauge_metrics_path: pathlib.Path,
     metrics_to_calculate: Optional[list[str]] = METRICS,
     lead_times: list[str] = data_paths.LEAD_TIMES,
     time_periods: Optional[dict[str, list[str]]] = None,
@@ -266,7 +266,7 @@ def calculate_and_save_metrics_for_many_gagues(
 
     for gauge in tqdm.tqdm(gauges):
         if gauge in ds.gauge_id.values:
-            gauge_metrics_df = _calculate_and_save_metrics_for_one_gague(
+            gauge_metrics_df = _calculate_and_save_metrics_for_one_gauge(
                 ds=ds,
                 gauge=gauge,
                 sim_variable=sim_variable,
@@ -274,10 +274,10 @@ def calculate_and_save_metrics_for_many_gagues(
                 metrics_to_calculate=metrics_to_calculate,
                 lead_times=lead_times,
                 time_period=time_periods[gauge],
-                base_path=breakpoints_path,
+                base_path=per_gauge_metrics_path,
                 path_modifier=path_modifier,
             )
-    
+
         # Store the results in a dataframe formatted as above.
         for metric in metrics_to_calculate:
             gauges_metrics[metric].loc[gauge] = gauge_metrics_df.loc[metric]
@@ -288,45 +288,45 @@ def calculate_and_save_metrics_for_many_gagues(
         _ = save_metrics_df(
             df=gauges_metrics[metric],
             metric=metric,
-            base_path=base_path,
+            base_path=aggregated_metrics_path,
             path_modifier=path_modifier,
         )
 
     return gauges_metrics
 
 
-def calculate_and_save_metrics_for_many_gagues_and_many_models(
+def calculate_and_save_metrics_for_many_gauges_and_many_models(
     restart: bool,
     experiments: list[str],
     ds: dict[str, xarray.Dataset],
     gauges: str,
     sim_variable: str,
     obs_variable: str,
-    base_path: pathlib.Path,
-    breakpoints_path: pathlib.Path,
+    aggregated_metrics_path: pathlib.Path,
+    per_gauge_metrics_path: pathlib.Path,
     metrics_to_calculate: Optional[list[str]] = METRICS,
     lead_times: list[str] = data_paths.LEAD_TIMES,
     time_periods: Optional[dict[str, list[str]]] = None,
 ) -> dict[int, pd.DataFrame]:
     """Calculates metrics for many gauges and many models."""
 
-    if os.path.exists(base_path) and restart:
-        shutil.rmtree(base_path)
-    loading_utils.create_remote_folder_if_necessary(base_path)
-    if os.path.exists(breakpoints_path) and restart:
-        shutil.rmtree(breakpoints_path)
-    loading_utils.create_remote_folder_if_necessary(breakpoints_path)
+    if os.path.exists(aggregated_metrics_path) and restart:
+        shutil.rmtree(aggregated_metrics_path)
+    loading_utils.create_remote_folder_if_necessary(aggregated_metrics_path)
+    if os.path.exists(per_gauge_metrics_path) and restart:
+        shutil.rmtree(per_gauge_metrics_path)
+    loading_utils.create_remote_folder_if_necessary(per_gauge_metrics_path)
 
     gauge_metrics = {}
     for experiment in experiments:
         print(f'Working on experiment: {experiment}.')
-        gauge_metrics[experiment] = calculate_and_save_metrics_for_many_gagues(
+        gauge_metrics[experiment] = calculate_and_save_metrics_for_many_gauges(
             ds=ds[experiment],
             gauges=gauges,
             sim_variable=sim_variable,
             obs_variable=obs_variable,
-            base_path=base_path,
-            breakpoints_path=breakpoints_path,
+            aggregated_metrics_path=aggregated_metrics_path,
+            per_gauge_metrics_path=per_gauge_metrics_path,
             metrics_to_calculate=metrics_to_calculate,
             path_modifier=experiment,
             time_periods=time_periods,
