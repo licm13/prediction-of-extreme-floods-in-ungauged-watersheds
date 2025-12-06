@@ -11,17 +11,26 @@ from tqdm import tqdm
 # (假设 models/ 和 notebooks/ 位于同一父目录下)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-notebooks_backend_dir = os.path.join(parent_dir, 'notebooks', 'backend')
-sys.path.append(notebooks_backend_dir)
+notebooks_dir = os.path.join(parent_dir, 'notebooks')
+
+# Add notebooks directory to sys.path so that 'from backend import ...' works
+if notebooks_dir not in sys.path:
+    sys.path.insert(0, notebooks_dir)
 
 try:
     from backend import loading_utils 
     from backend import data_paths
     from backend import metrics_utils
-except ImportError:
+except ImportError as e:
     print("Error: Could not import from notebooks/backend.")
-    print(f"Attempted to add path: {notebooks_backend_dir}")
-    print("Please ensure 'models' and 'notebooks' directories are siblings.")
+    print(f"Project structure check:")
+    print(f"  Current file: {current_dir}")
+    print(f"  Parent directory: {parent_dir}")
+    print(f"  Looking for notebooks at: {notebooks_dir}")
+    print(f"  Notebooks directory exists: {os.path.isdir(notebooks_dir)}")
+    print(f"  Backend directory exists: {os.path.isdir(os.path.join(notebooks_dir, 'backend'))}")
+    print(f"\nImport error: {e}")
+    print("\nPlease ensure 'models' and 'notebooks' directories are siblings.")
     sys.exit(1)
 
 # PyTorch and related imports

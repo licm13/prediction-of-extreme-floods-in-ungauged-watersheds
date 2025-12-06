@@ -16,11 +16,20 @@ import os
 # Add backend to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-notebooks_backend_dir = os.path.join(parent_dir, 'notebooks', 'backend')
-sys.path.append(notebooks_backend_dir)
+notebooks_dir = os.path.join(parent_dir, 'notebooks')
 
-from backend import loading_utils
-from backend import metrics_utils
+# Add notebooks directory to sys.path so that 'from backend import ...' works
+if notebooks_dir not in sys.path:
+    sys.path.insert(0, notebooks_dir)
+
+try:
+    from backend import loading_utils
+    from backend import metrics_utils
+except ImportError as e:
+    print(f"Error: Could not import from notebooks/backend.")
+    print(f"Attempted to add path: {notebooks_dir}")
+    print(f"Please ensure 'models' and 'notebooks' directories are siblings.")
+    raise
 
 
 class HydroDataLoader:

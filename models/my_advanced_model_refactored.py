@@ -24,8 +24,11 @@ import pathlib
 # Ensure backend is in path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-notebooks_backend_dir = os.path.join(parent_dir, 'notebooks', 'backend')
-sys.path.append(notebooks_backend_dir)
+notebooks_dir = os.path.join(parent_dir, 'notebooks')
+
+# Add notebooks directory to sys.path so that 'from backend import ...' works
+if notebooks_dir not in sys.path:
+    sys.path.insert(0, notebooks_dir)
 
 try:
     from backend import loading_utils
@@ -34,8 +37,11 @@ try:
     from backend import metrics
     from backend.return_period_calculator import return_period_calculator
     from backend.return_period_calculator import exceptions as rpc_exceptions
-except ImportError:
+except ImportError as e:
     print("Error: Could not import from notebooks/backend.")
+    print(f"Attempted to add path: {notebooks_dir}")
+    print(f"Import error: {e}")
+    print("Please ensure 'models' and 'notebooks' directories are siblings.")
     sys.exit(1)
 
 # Import the new data loader
