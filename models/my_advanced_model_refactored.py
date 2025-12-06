@@ -45,7 +45,10 @@ except ImportError as e:
     sys.exit(1)
 
 # Import the new data loader
-from hydro_data_loader import HydroDataLoader, PreprocessedHydroDataset
+try:
+    from hydro_data_loader import HydroDataLoader, PreprocessedHydroDataset
+except ImportError:
+    from .hydro_data_loader import HydroDataLoader, PreprocessedHydroDataset
 
 # PyTorch and related imports
 import torch
@@ -60,7 +63,10 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader as GeometricDataLoader
 
 # Import common model architectures
-from common import HybridGNN_RNN, collate_fn
+try:
+    from common import HybridGNN_RNN, collate_fn
+except ImportError:
+    from .common import HybridGNN_RNN, collate_fn
 
 
 # ==================== Improved Dataset ====================

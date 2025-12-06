@@ -47,7 +47,11 @@ from torch_geometric.loader import DataLoader as GeometricDataLoader
 from torch_geometric.utils import k_hop_subgraph
 
 # Import common model architectures
-from common import HybridGNN_RNN, collate_fn
+try:
+    from common import HybridGNN_RNN, collate_fn
+except ImportError:
+    # If direct import fails, try relative import
+    from .common import HybridGNN_RNN, collate_fn
 
 
 # ==================== Custom Dataset ====================
