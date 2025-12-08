@@ -2,7 +2,9 @@
 
 import pathlib
 
-_WORKING_DIR = pathlib.Path('/home/gsnearing/github_repo/global_streamflow_model_paper')
+# Use relative path from this file's location to the repository root
+# This makes the code portable across different systems
+_WORKING_DIR = pathlib.Path(__file__).parent.parent.parent
 
 # --- Experiment Definition ----------------------------------------------------
 

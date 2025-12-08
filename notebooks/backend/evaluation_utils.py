@@ -18,12 +18,20 @@ from backend import metrics_utils
 # Which return periods to evalaute.
 RETURN_PERIODS = [1.01, 2, 5, 10, 20, 50]
 
-# Country outlines. Read a GeoDataFrame from file (this is the only way I've
-# found within the Google environment).
-COUNTRIES = gpd.read_file(
-    open(data_paths.COUNTRY_POLYGONS_FILENAME))
-COUNTRIES.rename(columns={'name': 'country_name'}, inplace=True)
-COUNTRIES = COUNTRIES[COUNTRIES['continent'] != 'Antarctica']
+# Country outlines. Load from Natural Earth Data via URL.
+# Using try/except to handle potential download issues gracefully.
+try:
+    # Load directly from Natural Earth Data S3 bucket
+    url = 'https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip'
+    COUNTRIES = gpd.read_file(url)
+    # Normalize column names to match expected format
+    COUNTRIES.rename(columns={'NAME': 'country_name', 'CONTINENT': 'continent'}, inplace=True)
+    COUNTRIES = COUNTRIES[COUNTRIES['continent'] != 'Antarctica']
+except Exception as e:
+    print(f"Warning: Could not load country boundaries from Natural Earth: {e}")
+    print("Country boundary plotting will not be available.")
+    # Create empty GeoDataFrame as fallback
+    COUNTRIES = gpd.GeoDataFrame()
 
 EXPERIMENT_NAMES = {
     name: name.replace('_', ' ').title()
